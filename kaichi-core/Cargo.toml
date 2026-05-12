@@ -16,8 +16,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anndata = { workspace = true }
 anndata-hdf5 = { workspace = true }
+polars = { workspace = true }
 nalgebra-sparse = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
 csv = "1"
+tempfile = "3"

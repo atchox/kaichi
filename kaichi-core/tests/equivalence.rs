@@ -88,6 +88,7 @@ fn load_input() -> AssignmentInput {
     let h5ad = common::schraivogel_h5ad();
     read_h5ad(&h5ad)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", h5ad.display()))
+        .input
 }
 
 // ---------------------------------------------------------------------------

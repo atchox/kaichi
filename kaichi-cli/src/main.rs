@@ -32,7 +32,9 @@ fn main() -> Result<()> {
         Commands::Assign { counts, model, output } => {
             eprintln!("reading {}", counts.display());
             let t0 = Instant::now();
-            let input = kaichi_core::io::h5ad::read_h5ad(&counts)?;
+            let loaded = kaichi_core::io::h5ad::read_h5ad(&counts)?;
+            let input = loaded.input;
+            let var_names = loaded.var_names;
             let n_cells = input.covariates.num_rows();
             let n_nnz = input.counts.num_rows();
             eprintln!("loaded {n_cells} cells, {n_nnz} non-zero entries in {:.2}s", t0.elapsed().as_secs_f64());
@@ -43,7 +45,20 @@ fn main() -> Result<()> {
             eprintln!("assigned {} cells in {:.2}s", result.num_rows(), t1.elapsed().as_secs_f64());
 
             if let Some(out_path) = output {
-                write_csv(&result, &out_path)?;
+                match out_path.extension().and_then(|e| e.to_str()) {
+                    Some("h5ad") => {
+                        let obs_names: Vec<String> = {
+                            use arrow::array::{Array, StringArray};
+                            let col = input.covariates.column_by_name("cell_barcode").unwrap();
+                            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                            (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+                        };
+                        kaichi_core::io::write_h5ad::write_h5ad(
+                            &input, &result, &obs_names, &var_names, &out_path, &model,
+                        )?;
+                    }
+                    _ => write_csv(&result, &out_path)?,
+                }
                 eprintln!("wrote {}", out_path.display());
             }
         }

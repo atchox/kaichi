@@ -12,13 +12,20 @@ use arrow::{
 use anyhow::{bail, Context, Result};
 use std::{path::Path, sync::Arc};
 
-/// Read a guide-count H5AD and return an AssignmentInput ready for any model.
+/// Loaded contents of a guide-count H5AD.
+pub struct H5adInput {
+    pub input: AssignmentInput,
+    /// Guide IDs in original matrix column order, needed for writing H5AD output.
+    pub var_names: Vec<String>,
+}
+
+/// Read a guide-count H5AD and return an AssignmentInput plus var_names.
 ///
 /// Expects:
 ///   obs_names — cell barcodes
 ///   var_names — guide IDs
 ///   X         — sparse UMI count matrix (cells × guides), any integer dtype
-pub fn read_h5ad(path: &Path) -> Result<AssignmentInput> {
+pub fn read_h5ad(path: &Path) -> Result<H5adInput> {
     let store = H5::open(path)
         .with_context(|| format!("cannot open H5AD: {}", path.display()))?;
     let adata = anndata::AnnData::<H5>::open(store)
@@ -94,9 +101,12 @@ pub fn read_h5ad(path: &Path) -> Result<AssignmentInput> {
     )
     .context("failed to build covariates RecordBatch")?;
 
-    Ok(AssignmentInput {
-        counts: counts_batch,
-        covariates: covariate_batch,
+    Ok(H5adInput {
+        input: AssignmentInput {
+            counts: counts_batch,
+            covariates: covariate_batch,
+        },
+        var_names,
     })
 }
 
