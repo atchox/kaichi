@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
 
-const VERSION: &str = git_version::git_version!();
+const VERSION: &str = git_version::git_version!(fallback = env!("CARGO_PKG_VERSION"));
 
 #[derive(Parser)]
 #[command(name = "kaichi", version = VERSION, about = "CRISPR guide assignment for Perturb-seq")]
