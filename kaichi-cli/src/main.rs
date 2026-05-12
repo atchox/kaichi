@@ -3,8 +3,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
 
+const VERSION: &str = git_version::git_version!();
+
 #[derive(Parser)]
-#[command(name = "kaichi", version, about = "CRISPR guide assignment for Perturb-seq")]
+#[command(name = "kaichi", version = VERSION, about = "CRISPR guide assignment for Perturb-seq")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

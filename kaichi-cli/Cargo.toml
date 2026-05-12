@@ -14,6 +14,7 @@ kaichi-core = { path = "../kaichi-core" }
 arrow = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+git-version = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 indicatif = "0.17"
