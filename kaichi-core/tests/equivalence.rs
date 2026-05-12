@@ -4,6 +4,7 @@ use kaichi_core::io::h5ad::read_h5ad;
 use kaichi_core::models::{
     AssignmentInput,
     max::MaxModel,
+    poisson_gauss::PoissonGaussModel,
     ratio::RatioModel,
     umi::UmiModel,
     AssignmentModel,
@@ -133,6 +134,20 @@ fn ratio_equivalence() {
     assert!(
         agreement >= MIN_AGREEMENT,
         "ratio: agreement {:.4} < {MIN_AGREEMENT}",
+        agreement
+    );
+}
+
+#[test]
+fn poisson_gauss_equivalence() {
+    let input = load_input();
+    let model = PoissonGaussModel::default();
+    let result = model.assign(&input).unwrap();
+    let reference = load_reference("poisson_gauss");
+    let agreement = confident_call_agreement(&result, &reference);
+    assert!(
+        agreement >= MIN_AGREEMENT,
+        "poisson_gauss: agreement {:.4} < {MIN_AGREEMENT}",
         agreement
     );
 }

@@ -19,8 +19,11 @@ Provides UMI-level records before cell/UMI filtering. Enables kaichi to apply it
 deduplication strategy rather than accepting Cell Ranger's defaults.
 Preferred when the assignment model needs raw UMI counts (e.g., mixture models).
 
-### 2. Guide library reference (required)
-TSV with at minimum:
+### 2. Guide library reference (optional)
+Counts are sufficient to assign cells to guide IDs. A guide library is optional
+metadata used to validate guide IDs and enrich outputs with biological annotations.
+
+When provided, it is a TSV with at minimum:
 
 ```
 guide_id        target_gene     sequence
@@ -29,8 +32,12 @@ sgCDKN1A_2      CDKN1A          TTGGCAATGCTAGCAT
 sgNTC_1         non-targeting   AAAAAAAAAAAAAAAA
 ```
 
-Optional columns (included in `.var` of the output CRISPR modality if present):
+Additional optional columns (included in `.var` of the output CRISPR modality if present):
 `chromosome`, `cut_site`, `strand`, `on_target_score`
+
+If no guide library is provided, kaichi still emits a valid result with guide IDs from
+the count matrix. In that mode `.var` contains a minimal guide table and annotation
+fields such as `target_gene` and `sequence` are null or absent.
 
 ### 3. Existing single-cell object (optional)
 
@@ -60,13 +67,14 @@ MuData (.h5mu)
 └── mod['crispr']  AnnData  — guide assignment results
     ├── X                   sparse UInt32 matrix  (cells × guides, raw UMI counts)
     ├── obs                 per-cell assignment (see Data Model)
-    ├── var                 guide library metadata (from reference TSV)
+    ├── var                 guide IDs plus optional guide library metadata
     └── uns['kaichi']       run metadata: model used, parameters, kaichi version
 ```
 
 ### Fallback: H5AD (guide-only)
 When no RNA object is provided and the caller wants a simpler file:
-A single AnnData where `.X` = guide counts, `.obs` = guide calls, `.var` = guide library.
+A single AnnData where `.X` = guide counts, `.obs` = guide calls, and `.var` =
+guide IDs plus optional guide library metadata.
 
 ### In-memory (binding return value)
 
@@ -88,14 +96,13 @@ import kaichi
 # Minimal — from Cell Ranger directory
 result = kaichi.assign_guides(
     counts="path/to/filtered_feature_bc_matrix/",
-    guide_library="guides.tsv",
     model="max",                # see assignment-models.md
 )
 
 # Attach to existing RNA object, fit a per-guide NB mixture
 result = kaichi.assign_guides(
     counts="molecule_info.h5",
-    guide_library="guides.tsv",
+    guide_library="guides.tsv",  # optional metadata / validation
     input="rna.h5ad",           # AnnData or MuData; path or in-memory object
     model="neg_binomial",
     barcode_join="inner",
@@ -113,7 +120,6 @@ library(kaichi)
 # Default — returns a Seurat object; guide modality as assay "crispr"
 obj <- assign_guides(
   counts = "filtered_feature_bc_matrix/",
-  guide_library = "guides.tsv",
   model = "max",
   input = "rna.rds"     # optional; path, Seurat object, or H5AD/H5MU path
 )
@@ -121,7 +127,7 @@ obj <- assign_guides(
 # Bioconductor users — returns a SingleCellExperiment with altExp("crispr")
 sce <- assign_guides(
   counts = "filtered_feature_bc_matrix/",
-  guide_library = "guides.tsv",
+  guide_library = "guides.tsv", # optional metadata / validation
   model = "neg_binomial",
   format = "sce"
 )

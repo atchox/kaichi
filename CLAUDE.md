@@ -103,6 +103,8 @@ n_guides_detected      UInt8
 ```
 
 `is_unassigned` and `is_multi_infected` are mutually exclusive.
+`target_gene` is nullable when no guide-library metadata is supplied; guide-ID-only
+assignments are valid.
 
 ---
 

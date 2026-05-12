@@ -5,6 +5,7 @@ use serde_json::Value;
 pub mod umi;
 pub mod max;
 pub mod ratio;
+pub mod poisson_gauss;
 
 /// Input to all assignment models: the sparse count matrix plus per-cell covariates,
 /// both represented as Arrow RecordBatches.

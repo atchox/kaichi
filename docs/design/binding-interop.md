@@ -80,7 +80,7 @@ def _adata_to_arrow_inputs(adata):
         pa.array(X.indptr),
     ], names=["data", "indices", "indptr"])
 
-    # var (guide library): subset of columns we care about
+    # var: guide IDs plus optional guide-library metadata
     var = pa.Table.from_pandas(
         adata.var[["guide_id", "target_gene", "sequence", ...]]
     )
@@ -218,10 +218,10 @@ vs base R DataFrame, sparse matrix conventions) are purely cosmetic.
   single matrix exceeds ~4G nnz (unlikely for guide data).
 
 ### Categorical columns
-- `guide_id`, `target_gene`, `batch` are categorical. Arrow `DictionaryArray`
-  preserves the encoding through the boundary; both pyo3-arrow and the R
-  arrow package handle it natively. Avoid materializing as raw strings unless
-  you need to.
+- `guide_id`, `target_gene`, `batch` are categorical. `target_gene` is nullable
+  when guide metadata is absent. Arrow `DictionaryArray` preserves the encoding
+  through the boundary; both pyo3-arrow and the R arrow package handle it natively.
+  Avoid materializing as raw strings unless you need to.
 
 ### Memory layout in Rust
 - The compute kernel typically wants the (cells × guides) sparse matrix in
@@ -231,7 +231,7 @@ vs base R DataFrame, sparse matrix conventions) are purely cosmetic.
 
 ### When in-memory inputs come in WITHOUT an existing AnnData
 
-If a user calls `kaichi.assign_guides(counts="cellranger_dir/", guide_library="guides.tsv")`
+If a user calls `kaichi.assign_guides(counts="cellranger_dir/")`
 with no `input=` argument, no AnnData ever exists on the Python side until the
 end. The flow is:
 1. Python binding hands `counts_dir` (a string) to Rust.
@@ -240,6 +240,10 @@ end. The flow is:
 4. Python binding constructs AnnData / MuData from the result.
 
 Same flow for R. The disk read happens in Rust regardless of language.
+
+If `guide_library="guides.tsv"` is supplied, the binding passes that path through to
+the Rust core for validation and metadata enrichment. If omitted, the result is still
+constructed from guide IDs present in the count input.
 
 ---
 

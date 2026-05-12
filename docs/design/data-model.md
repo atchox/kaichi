@@ -17,7 +17,9 @@ is_multi_infected     Boolean                    # true if multiple guides detec
 n_guides_detected     UInt8                      # number of guides with UMI count > background
 ```
 
-`guide_id` and `target_gene` are null when `is_unassigned = true`.
+`guide_id` is null when `is_unassigned = true`.
+`target_gene` is null when `is_unassigned = true` or when no guide-library metadata
+was supplied for the assigned guide.
 `is_multi_infected` and `is_unassigned` are mutually exclusive.
 
 ## MuData structure: `mod['crispr']` AnnData
@@ -25,14 +27,21 @@ n_guides_detected     UInt8                      # number of guides with UMI cou
 ```
 .X          sparse UInt32             cells × guides, raw UMI counts
 .obs        DataFrame                 one row per cell (columns = Arrow schema above)
-.var        DataFrame                 one row per guide (from guide library reference TSV)
+.var        DataFrame                 one row per guide (guide IDs plus optional metadata)
 .uns['kaichi']  dict                  run provenance (see below)
 ```
 
-### `.var` columns (guide library)
+### `.var` columns
+
+Minimal guide-ID-only output:
 
 ```
 guide_id              index (Utf8)
+```
+
+When a guide library is supplied, kaichi adds metadata columns:
+
+```
 target_gene           Utf8
 sequence              Utf8
 chromosome            Utf8        (optional, null if not in reference)
@@ -41,6 +50,10 @@ strand                Utf8        (optional, "+" / "-")
 on_target_score       Float32     (optional)
 is_non_targeting      Boolean     (derived: target_gene in {"non-targeting", "NTC", "safe-harbor"})
 ```
+
+`target_gene`, `sequence`, and derived metadata are nullable or absent when no guide
+library is provided. The assignment itself remains valid because `guide_id` comes
+from the count matrix.
 
 ### `.uns['kaichi']`
 

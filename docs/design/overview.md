@@ -3,9 +3,9 @@
 ## What kaichi does
 
 kaichi assigns CRISPR guide RNAs to cells from 10x Genomics Perturb-seq data. It takes
-Cell Ranger feature-barcode output and a guide library reference, runs one of several
-assignment models, and writes a MuData file (Python) or Seurat object (R) with guide
-calls attached.
+Cell Ranger feature-barcode output, optionally enriches guide IDs with guide-library
+metadata, runs one of several assignment models, and writes a MuData file (Python) or
+Seurat object (R) with guide calls attached.
 
 It does **not** handle RNA expression — that is Cell Ranger's job. kaichi picks up where
 Cell Ranger leaves off.
@@ -42,7 +42,7 @@ kaichi's positioning:
 
 ```
 Cell Ranger output (MTX / molecule_info.h5)
-Guide library TSV
+Optional guide library TSV
         │
         ▼
 ┌─────────────────────────────────────────┐

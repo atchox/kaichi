@@ -68,9 +68,9 @@ kaichi --version
 
 kaichi assign \
     --counts <PATH>            # Cell Ranger dir, molecule_info.h5, h5ad, or h5mu
-    --guide-library <TSV>      # required
     --output <PATH>            # .h5mu, .h5ad
     --model <NAME>             # umi, max, ratio, neg_binomial, poisson_gauss, ...
+    [--guide-library <TSV>]    # optional guide metadata / validation
     [--input <PATH>]           # existing h5ad / h5mu to attach the crispr modality to
     [--params <JSON or @file>] # model-specific overrides
     [--barcode-join inner|left|outer]  # default: inner
@@ -102,6 +102,11 @@ Performance benchmarking is **out of scope for kaichi itself** — it's run
 externally via omnibenchmark, which only needs `kaichi assign` to behave well
 on stdin/stdout/exit codes.
 
+`--counts` is the only biological input required for assignment. `--guide-library`
+is optional: when supplied, kaichi validates counted guide IDs against it and carries
+metadata such as `target_gene` and `sequence` into the output. Without it, kaichi
+emits guide-ID-only assignments with nullable or absent annotation fields.
+
 ---
 
 ## Parameter overrides
@@ -131,6 +136,9 @@ Keys map to the parameter names documented per model in
 [data-model.md](data-model.md). `--output out.h5ad` writes a single-modality
 AnnData (guide-only).
 
+If `--guide-library` is omitted, `.var` is built from guide IDs observed in the count
+input. If it is provided, `.var` is enriched with the TSV metadata.
+
 If `--input` is provided, the input file's RNA modality is included in the
 output via structural HDF5 copy (see [storage-encoding.md](storage-encoding.md)).
 
@@ -145,7 +153,7 @@ If `--input` is omitted and `--output` is `.h5mu`, the file contains only
 |---|---|
 | 0 | Success |
 | 1 | Generic error (file not found, parse failure, invalid args) |
-| 2 | Input validation failed (guide library mismatch, no shared barcodes) |
+| 2 | Input validation failed (guide-library mismatch if supplied, no shared barcodes) |
 | 3 | Model fitting failed (EM divergence on all guides, etc.) |
 | 4 | I/O error during read / write |
 | 64 | Usage error (clap's default for misuse) |

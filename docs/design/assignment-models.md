@@ -223,8 +223,20 @@ Closed-form weighted Poisson MLE is available — even faster M-step than NB.
 Gaussian on log-counts. The Gaussian component has closed-form M-step; Poisson
 does too. Should be the fastest of the hierarchical models.
 
-Parameters: same shape as `neg_binomial`. Algorithm follows the same EM
-template with model-specific PMFs and updates.
+Implemented parameters:
+
+```
+min_confidence  Float32  default: 0.5
+max_em_iters    UInt32   default: 100
+tol             Float32  default: 1e-6
+min_nonzero     UInt32   default: 2
+min_max_count   UInt32   default: 2
+```
+
+Assignment follows the same posterior-threshold pattern as `neg_binomial`: each
+guide is fit independently, cells with posterior signal probability above
+`min_confidence` are candidates, and cells with multiple passing guides are marked
+multi-infected.
 
 ---
 
@@ -300,6 +312,11 @@ pub trait AssignmentModel: Send + Sync {
 - `covariates`: per-cell batch (categorical) and total_counts (Float32).
 - Output: schema in [data-model.md](data-model.md).
 - `params_json`: serialized parameters for `uns['kaichi']['model_params']`.
+
+Models require guide IDs and counts, not guide-library metadata. If a guide library is
+provided, metadata enrichment happens before writing or object construction so fields
+such as `target_gene` can be populated. Without a guide library, assignments remain
+valid at the `guide_id` level and annotation fields stay null or absent.
 
 Per-guide work happens inside `assign`. Models are free to use `rayon::par_iter`
 over guides internally; the trait is `Send + Sync` to allow callers to share models

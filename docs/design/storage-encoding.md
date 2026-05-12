@@ -160,7 +160,8 @@ kaichi only needs cell barcodes for the join.
 **Case B: input contains existing guide counts (recompute)**
 kaichi needs the count matrix and var metadata.
 - Use anndata-rs to read the `crispr` modality (or root, if a guide-only H5AD).
-- Extract: `obs_names`, `var_names`, `var` columns (target_gene, sequence, etc.), `X`.
+  - Extract: `obs_names`, `var_names`, optional `var` columns (target_gene, sequence,
+    etc.), `X`.
 - Convert to Arrow `RecordBatch` for the compute layer.
 
 ---
@@ -175,7 +176,7 @@ Procedure:
 2. Construct an anndata-rs `AnnData` with:
    - `X`: sparse CSR UInt32 matrix (cells × guides)
    - `obs`: DataFrame from the Arrow batch
-   - `var`: DataFrame from the guide library reference
+   - `var`: DataFrame from guide IDs plus optional guide library reference metadata
    - `uns/kaichi`: provenance dict
 3. Tell anndata-rs to write at the destination HDF5 path — `/mod/crispr/` of the
    output H5MU, or `/` of a standalone H5AD.
