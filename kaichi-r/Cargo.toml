@@ -1,0 +1,15 @@
+[package]
+name = "kaichi-r"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "kaichi"
+crate-type = ["cdylib"]
+
+[dependencies]
+kaichi-core = { path = "../kaichi-core" }
+anyhow = { workspace = true }
+# extendr-api added when R binding work begins

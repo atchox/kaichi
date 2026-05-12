@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "kaichi-core",
+    "kaichi-cli",
+    "kaichi-py",
+    "kaichi-r",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["kaichi contributors"]
+license = "MIT"
+
+[workspace.dependencies]
+# Arrow
+arrow = { version = "53", features = ["prettyprint"] }
+
+# AnnData I/O
+anndata = { git = "https://github.com/scverse/anndata-rs", rev = "cf0b312f2834884bd708595a63f12f34f1905b7b" }
+anndata-hdf5 = { git = "https://github.com/scverse/anndata-rs", rev = "cf0b312f2834884bd708595a63f12f34f1905b7b" }
+
+# Numerics
+ndarray = "0.17"
+nalgebra-sparse = "0.11"
+statrs = "0.17"
+
+# Parallelism
+rayon = "1.10"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Testing
+approx = "0.5"
+

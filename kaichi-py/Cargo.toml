@@ -1,0 +1,15 @@
+[package]
+name = "kaichi-py"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "kaichi"
+crate-type = ["cdylib"]
+
+[dependencies]
+kaichi-core = { path = "../kaichi-core" }
+anyhow = { workspace = true }
+# pyo3 and pyo3-arrow added when Python binding work begins

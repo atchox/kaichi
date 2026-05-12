@@ -1,0 +1,19 @@
+[package]
+name = "kaichi-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kaichi"
+path = "src/main.rs"
+
+[dependencies]
+kaichi-core = { path = "../kaichi-core" }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+indicatif = "0.17"
+serde_json = { workspace = true }
