@@ -1,6 +1,7 @@
 use crate::models::AssignmentInput;
 use anndata::{
     AnnDataOp, AxisArraysOp,
+    backend::{WriteConfig, Compression},
     data::{DataFrameIndex, DynCsrMatrix, ArrayData},
 };
 use anndata_hdf5::H5;
@@ -33,6 +34,14 @@ pub fn write_h5ad(
     path: &Path,
     model_name: &str,
 ) -> Result<()> {
+    // Write with gzip so h5py can read it without external HDF5 filter plugins.
+    // The anndata-hdf5 default is blosc_zstd (filter 32001), which needs
+    // hdf5-external-filter-plugins in the conda env.
+    anndata::backend::set_default_write_config(WriteConfig {
+        compression: Some(Compression::Gzip(3)),
+        ..Default::default()
+    });
+
     let n_cells = obs_names.len();
     let n_guides = var_names.len();
 
