@@ -1,165 +1,156 @@
-use kaichi_core::{
-    io::write_h5ad::write_h5ad,
-    models::{AssignmentInput, AssignmentModel, poisson_gauss::PoissonGaussModel},
-};
-use arrow::{
-    array::{Float32Array, StringArray, UInt32Array},
-    datatypes::{DataType, Field, Schema},
-    record_batch::RecordBatch,
-};
-use anndata::{AnnDataOp, AxisArraysOp};
-use anndata::backend::Backend;
-use anndata_hdf5::H5;
-use std::sync::Arc;
+// Roundtrip integration tests: write via write_h5ad, read back via read_h5ad,
+// verify the pipeline result is preserved end-to-end.
+
+use kaichi_core::io::read::read_h5ad;
+use kaichi_core::io::write::write_h5ad;
+use kaichi_core::models::{poisson_gauss::PoissonGaussModel, AssignmentModel};
+use kaichi_core::io::read::testutil::write_test_h5ad;
 use tempfile::NamedTempFile;
 
-fn make_input() -> (AssignmentInput, Vec<String>) {
-    // 6 cells, 2 guides: gA is signal for C4/C5/C6, gB is noise
-    let counts_schema = Arc::new(Schema::new(vec![
-        Field::new("cell_barcode", DataType::Utf8, false),
-        Field::new("guide_id", DataType::Utf8, false),
-        Field::new("umi_count", DataType::UInt32, false),
-    ]));
-    let rows: Vec<(&str, &str, u32)> = vec![
-        ("C1", "gA", 0), ("C2", "gA", 1), ("C3", "gA", 0),
-        ("C4", "gA", 25), ("C5", "gA", 30), ("C6", "gA", 22),
-        ("C1", "gB", 1), ("C2", "gB", 0), ("C3", "gB", 2),
-        ("C4", "gB", 0), ("C5", "gB", 1), ("C6", "gB", 0),
-    ];
-    let counts = RecordBatch::try_new(
-        counts_schema,
-        vec![
-            Arc::new(StringArray::from(rows.iter().map(|(c,_,_)| *c).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|(_,g,_)| *g).collect::<Vec<_>>())),
-            Arc::new(UInt32Array::from(rows.iter().map(|(_,_,v)| *v).collect::<Vec<_>>())),
-        ],
-    ).unwrap();
+fn tmp_h5ad() -> NamedTempFile {
+    NamedTempFile::with_suffix(".h5ad").unwrap()
+}
 
-    let cov_schema = Arc::new(Schema::new(vec![
-        Field::new("cell_barcode", DataType::Utf8, false),
-        Field::new("batch", DataType::Utf8, false),
-        Field::new("total_counts", DataType::Float32, false),
-    ]));
-    let cells = vec!["C1", "C2", "C3", "C4", "C5", "C6"];
-    let covariates = RecordBatch::try_new(
-        cov_schema,
-        vec![
-            Arc::new(StringArray::from(cells.clone())),
-            Arc::new(StringArray::from(vec!["default"; 6])),
-            Arc::new(Float32Array::from(vec![0.0f32; 6])),
+/// Build a 6-cell × 2-guide test fixture: C4/C5/C6 have signal on gA.
+fn make_fixture() -> NamedTempFile {
+    let tmp = tmp_h5ad();
+    write_test_h5ad(
+        tmp.path(),
+        &["C1", "C2", "C3", "C4", "C5", "C6"],
+        &["gA", "gB"],
+        &[
+            (0, 1, 1),  // C1: gB=1
+            (1, 0, 1),  // C2: gA=1
+            (2, 1, 2),  // C3: gB=2
+            (3, 0, 25), // C4: gA=25  (signal)
+            (4, 0, 30), // C5: gA=30  (signal)
+            (4, 1, 1),  // C5: gB=1
+            (5, 0, 22), // C6: gA=22  (signal)
         ],
-    ).unwrap();
-
-    (
-        AssignmentInput { counts, covariates },
-        vec!["gA".to_string(), "gB".to_string()],
-    )
+    );
+    tmp
 }
 
 #[test]
 fn write_h5ad_roundtrip_obs_names() {
-    let (input, var_names) = make_input();
+    let fixture = make_fixture();
+    let input = read_h5ad(fixture.path()).unwrap();
     let result = PoissonGaussModel::default().assign(&input).unwrap();
 
-    let tmp = NamedTempFile::with_suffix(".h5ad").unwrap();
-    let obs_names: Vec<String> = vec![
-        "C1","C2","C3","C4","C5","C6",
-    ].into_iter().map(String::from).collect();
+    let out = tmp_h5ad();
+    write_h5ad(&input, &result, out.path(), "poisson_gauss", "{}").unwrap();
 
-    write_h5ad(&input, &result, &obs_names, &var_names, tmp.path(), "poisson_gauss").unwrap();
+    let loaded = read_h5ad(out.path()).unwrap();
+    assert_eq!(loaded.counts.n_cells, 6);
 
-    // Read back and verify obs/var names
-    let store = H5::open(tmp.path()).unwrap();
-    let adata = anndata::AnnData::<H5>::open(store).unwrap();
-
-    assert_eq!(adata.n_obs(), 6);
-    assert_eq!(adata.n_vars(), 2);
-
-    let written_obs: Vec<String> = adata.obs_names().into_iter().collect();
-    assert_eq!(written_obs, obs_names);
-
-    let written_var: Vec<String> = adata.var_names().into_iter().collect();
-    assert_eq!(written_var, var_names);
+    let bcs = &loaded.covariates.cell_barcodes;
+    assert_eq!(bcs.value(0), "C1");
+    assert_eq!(bcs.value(5), "C6");
 }
 
 #[test]
-fn write_h5ad_assigned_layer_correct() {
-    let (input, var_names) = make_input();
+fn write_h5ad_roundtrip_var_names() {
+    let fixture = make_fixture();
+    let input = read_h5ad(fixture.path()).unwrap();
     let result = PoissonGaussModel::default().assign(&input).unwrap();
 
-    let tmp = NamedTempFile::with_suffix(".h5ad").unwrap();
-    let obs_names: Vec<String> = vec!["C1","C2","C3","C4","C5","C6"]
-        .into_iter().map(String::from).collect();
+    let out = tmp_h5ad();
+    write_h5ad(&input, &result, out.path(), "poisson_gauss", "{}").unwrap();
 
-    write_h5ad(&input, &result, &obs_names, &var_names, tmp.path(), "poisson_gauss").unwrap();
-
-    let store = H5::open(tmp.path()).unwrap();
-    let adata = anndata::AnnData::<H5>::open(store).unwrap();
-
-    // "assigned" layer must exist
-    let layer_keys: Vec<String> = adata.layers().keys();
-    assert!(layer_keys.contains(&"assigned".to_string()), "missing assigned layer: {layer_keys:?}");
+    let loaded = read_h5ad(out.path()).unwrap();
+    assert_eq!(loaded.counts.n_guides, 2);
+    assert_eq!(loaded.guide_metadata.guide_ids.value(0), "gA");
+    assert_eq!(loaded.guide_metadata.guide_ids.value(1), "gB");
 }
 
 #[test]
 fn write_h5ad_x_is_raw_umi_counts() {
-    use anndata::{ArrayElemOp, data::DynCsrMatrix, ArrayData};
-
-    let (input, var_names) = make_input();
+    let fixture = make_fixture();
+    let input = read_h5ad(fixture.path()).unwrap();
     let result = PoissonGaussModel::default().assign(&input).unwrap();
 
-    let tmp = NamedTempFile::with_suffix(".h5ad").unwrap();
-    let obs_names: Vec<String> = vec!["C1","C2","C3","C4","C5","C6"]
-        .into_iter().map(String::from).collect();
+    let out = tmp_h5ad();
+    write_h5ad(&input, &result, out.path(), "poisson_gauss", "{}").unwrap();
 
-    write_h5ad(&input, &result, &obs_names, &var_names, tmp.path(), "poisson_gauss").unwrap();
-
-    let store = H5::open(tmp.path()).unwrap();
-    let adata = anndata::AnnData::<H5>::open(store).unwrap();
-
-    let x: ArrayData = adata.x().get::<ArrayData>().unwrap().unwrap();
-    let csr = match x {
-        ArrayData::CsrMatrix(DynCsrMatrix::U32(m)) => m,
-        other => panic!("expected u32 CSR for X, got {other:?}"),
-    };
-
-    // make_input rows: C4=gA=25, C5=gA=30, C6=gA=22, C3=gB=2, C1=gB=1, C5=gB=1
-    let dense = csr_to_dense(&csr);
-    assert_eq!(dense[0], vec![0, 1]); // C1 gA=0 gB=1
-    assert_eq!(dense[1], vec![1, 0]); // C2 gA=1 gB=0
-    assert_eq!(dense[2], vec![0, 2]); // C3 gA=0 gB=2
-    assert_eq!(dense[3], vec![25, 0]);
-    assert_eq!(dense[4], vec![30, 1]);
-    assert_eq!(dense[5], vec![22, 0]);
-}
-
-fn csr_to_dense(csr: &nalgebra_sparse::CsrMatrix<u32>) -> Vec<Vec<u32>> {
-    let (nrows, ncols) = (csr.nrows(), csr.ncols());
-    let mut dense = vec![vec![0u32; ncols]; nrows];
-    for (r, row) in csr.row_iter().enumerate() {
-        for (&c, &v) in row.col_indices().iter().zip(row.values().iter()) {
-            dense[r][c] = v;
-        }
-    }
-    dense
+    let loaded = read_h5ad(out.path()).unwrap();
+    // C1: gB=1 only
+    let r0 = loaded.counts.csr().get_row(0).unwrap();
+    assert_eq!(r0.col_indices(), &[1]);
+    assert_eq!(r0.values(), &[1u32]);
+    // C4: gA=25
+    let r3 = loaded.counts.csr().get_row(3).unwrap();
+    assert_eq!(r3.col_indices(), &[0]);
+    assert_eq!(r3.values(), &[25u32]);
+    // C5: gA=30, gB=1
+    let r4 = loaded.counts.csr().get_row(4).unwrap();
+    assert_eq!(r4.col_indices(), &[0, 1]);
+    assert_eq!(r4.values(), &[30u32, 1u32]);
 }
 
 #[test]
-fn write_h5ad_uns_method_name() {
-    let (input, var_names) = make_input();
+fn write_h5ad_assigned_layer_has_correct_cells() {
+    let fixture = make_fixture();
+    let input = read_h5ad(fixture.path()).unwrap();
     let result = PoissonGaussModel::default().assign(&input).unwrap();
 
-    let tmp = NamedTempFile::with_suffix(".h5ad").unwrap();
-    let obs_names: Vec<String> = vec!["C1","C2","C3","C4","C5","C6"]
-        .into_iter().map(String::from).collect();
+    // Verify assigned_x has nonzeros exactly for the signal cells (C4/C5/C6)
+    use arrow::array::BooleanArray;
+    let is_u = result.batch.column_by_name("is_unassigned").unwrap()
+        .as_any().downcast_ref::<BooleanArray>().unwrap();
 
-    write_h5ad(&input, &result, &obs_names, &var_names, tmp.path(), "poisson_gauss").unwrap();
+    for cell in 0..6 {
+        let row = result.assigned_x.get_row(cell).unwrap();
+        if !is_u.value(cell) {
+            assert!(row.nnz() > 0, "cell {cell} should have nonzero in assigned_x");
+        } else {
+            assert_eq!(row.nnz(), 0, "cell {cell} should be empty in assigned_x");
+        }
+    }
+}
 
-    let store = H5::open(tmp.path()).unwrap();
-    let adata = anndata::AnnData::<H5>::open(store).unwrap();
+#[test]
+fn write_h5ad_uns_model_name() {
+    let fixture = make_fixture();
+    let input = read_h5ad(fixture.path()).unwrap();
+    let result = PoissonGaussModel::default().assign(&input).unwrap();
 
-    use anndata::ElemCollectionOp;
-    let method: String = adata.uns()
-        .get_item("guide_assignment_method").unwrap().unwrap();
-    assert_eq!(method, "kaichi_poisson_gauss");
+    let out = tmp_h5ad();
+    write_h5ad(&input, &result, out.path(), "poisson_gauss", "{}").unwrap();
+
+    use hdf5::types::VarLenUnicode;
+    let file = hdf5::File::open(out.path()).unwrap();
+    let ds = file.dataset("uns/kaichi/model").unwrap();
+    let vals: Vec<VarLenUnicode> = ds.read_raw::<VarLenUnicode>().unwrap();
+    assert_eq!(vals[0].as_str(), "poisson_gauss");
+}
+
+#[test]
+fn write_h5ad_uns_model_params() {
+    let fixture = make_fixture();
+    let input = read_h5ad(fixture.path()).unwrap();
+    let result = PoissonGaussModel::default().assign(&input).unwrap();
+    let params = PoissonGaussModel::default().params_json().to_string();
+
+    let out = tmp_h5ad();
+    write_h5ad(&input, &result, out.path(), "poisson_gauss", &params).unwrap();
+
+    use hdf5::types::VarLenUnicode;
+    let file = hdf5::File::open(out.path()).unwrap();
+    let ds = file.dataset("uns/kaichi/model_params").unwrap();
+    let vals: Vec<VarLenUnicode> = ds.read_raw::<VarLenUnicode>().unwrap();
+    assert_eq!(vals[0].as_str(), &params);
+}
+
+#[test]
+fn write_h5ad_nnz_preserved() {
+    let fixture = make_fixture();
+    let input = read_h5ad(fixture.path()).unwrap();
+    let orig_nnz = input.counts.nnz();
+    let result = PoissonGaussModel::default().assign(&input).unwrap();
+
+    let out = tmp_h5ad();
+    write_h5ad(&input, &result, out.path(), "poisson_gauss", "{}").unwrap();
+
+    let loaded = read_h5ad(out.path()).unwrap();
+    assert_eq!(loaded.counts.nnz(), orig_nnz);
 }

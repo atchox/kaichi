@@ -1,22 +1,24 @@
-use super::{AssignmentInput, AssignmentModel};
+use super::AssignmentModel;
+use crate::data::{AssignmentResult, LoadedInput};
 use crate::schema::assignment_schema_ref;
 
+use anyhow::{Context, Result};
 use arrow::{
     array::{
-        BooleanBuilder, DictionaryArray, StringArray, StringDictionaryBuilder,
-        UInt32Array, UInt32Builder, UInt8Builder, Float32Builder,
+        BooleanBuilder, DictionaryArray, Float32Builder, StringArray,
+        StringDictionaryBuilder, UInt32Builder, UInt8Builder,
     },
     datatypes::Int16Type,
     record_batch::RecordBatch,
 };
-use anyhow::{Context, Result};
+use nalgebra_sparse::CsrMatrix;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Assign each cell-guide pair as positive if UMI count >= umi_threshold.
 ///
 /// - 0 guides above threshold → is_unassigned
-/// - 1 guide above threshold → assign
+/// - 1 guide above threshold → assign, confidence = 1.0
 /// - 2+ guides above threshold → is_multi_infected; assign to highest UMI
 pub struct UmiModel {
     pub umi_threshold: u32,
@@ -33,70 +35,33 @@ impl AssignmentModel for UmiModel {
         "umi"
     }
 
-    fn assign(&self, input: &AssignmentInput) -> Result<RecordBatch> {
-        let counts = &input.counts;
+    fn assign(&self, input: &LoadedInput) -> Result<AssignmentResult> {
+        let n_cells = input.counts.n_cells;
+        let n_guides = input.counts.n_guides;
+        let csr = input.counts.csr();
+        let guide_ids = &input.guide_metadata.guide_ids;
+        let cell_barcodes = &input.covariates.cell_barcodes;
 
-        let barcodes = counts
-            .column_by_name("cell_barcode")
-            .context("missing cell_barcode column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("cell_barcode is not Utf8")?;
+        let mut out_guide_ids: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
+        let mut out_target_genes: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
+        let mut out_umi_counts = UInt32Builder::with_capacity(n_cells);
+        let mut out_confidence = Float32Builder::with_capacity(n_cells);
+        let mut out_is_unassigned = BooleanBuilder::with_capacity(n_cells);
+        let mut out_is_multi = BooleanBuilder::with_capacity(n_cells);
+        let mut out_n_detected = UInt8Builder::with_capacity(n_cells);
 
-        let guide_ids = counts
-            .column_by_name("guide_id")
-            .context("missing guide_id column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("guide_id is not Utf8")?;
+        let mut assigned_triples: Vec<(usize, usize)> = Vec::new();
 
-        let umi_counts = counts
-            .column_by_name("umi_count")
-            .context("missing umi_count column")?
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .context("umi_count is not UInt32")?;
+        for cell in 0..n_cells {
+            let row = csr.get_row(cell).unwrap();
 
-        // Group rows by cell barcode.
-        let mut cell_guides: HashMap<&str, Vec<(&str, u32)>> = HashMap::new();
-        // Maintain insertion order for deterministic output.
-        let mut cell_order: Vec<&str> = Vec::new();
-
-        for i in 0..counts.num_rows() {
-            let barcode = barcodes.value(i);
-            let guide = guide_ids.value(i);
-            let count = umi_counts.value(i);
-            let entry = cell_guides.entry(barcode).or_insert_with(|| {
-                cell_order.push(barcode);
-                Vec::new()
-            });
-            entry.push((guide, count));
-        }
-
-        let n = cell_order.len();
-        let mut out_barcodes: Vec<&str> = Vec::with_capacity(n);
-        let mut out_guide_ids: StringDictionaryBuilder<Int16Type> =
-            StringDictionaryBuilder::new();
-        let mut out_target_genes: StringDictionaryBuilder<Int16Type> =
-            StringDictionaryBuilder::new();
-        let mut out_umi_counts = UInt32Builder::with_capacity(n);
-        let mut out_confidence = Float32Builder::with_capacity(n);
-        let mut out_is_unassigned = BooleanBuilder::with_capacity(n);
-        let mut out_is_multi = BooleanBuilder::with_capacity(n);
-        let mut out_n_detected = UInt8Builder::with_capacity(n);
-
-        for barcode in &cell_order {
-            let guides = &cell_guides[barcode];
-
-            let above: Vec<(&str, u32)> = guides
-                .iter()
-                .filter(|(_, c)| *c >= self.umi_threshold)
-                .cloned()
+            // Collect (guide_idx, count) for entries above threshold.
+            let above: Vec<(usize, u32)> = row.col_indices().iter().zip(row.values())
+                .filter(|(_, &v)| v >= self.umi_threshold)
+                .map(|(&g, &v)| (g, v))
                 .collect();
 
-            let n_detected = above.len().min(255) as u8;
-            out_barcodes.push(barcode);
-            out_n_detected.append_value(n_detected);
+            out_n_detected.append_value(above.len().min(255) as u8);
 
             match above.len() {
                 0 => {
@@ -108,53 +73,59 @@ impl AssignmentModel for UmiModel {
                     out_is_multi.append_value(false);
                 }
                 1 => {
-                    let (guide, count) = above[0];
-                    out_guide_ids.append_value(guide);
-                    out_target_genes.append_value(guide); // placeholder; real target_gene comes from guide library join
+                    let (g, count) = above[0];
+                    out_guide_ids.append_value(guide_ids.value(g));
+                    out_target_genes.append_null();
                     out_umi_counts.append_value(count);
                     out_confidence.append_value(1.0);
                     out_is_unassigned.append_value(false);
                     out_is_multi.append_value(false);
+                    assigned_triples.push((cell, g));
                 }
                 _ => {
                     // Multi-infected: assign to highest UMI guide.
-                    let (guide, count) = above
-                        .iter()
-                        .max_by_key(|(_, c)| c)
-                        .copied()
-                        .unwrap();
-                    out_guide_ids.append_value(guide);
-                    out_target_genes.append_value(guide);
+                    let (g, count) = above.iter().copied().max_by_key(|&(_, v)| v).unwrap();
+                    out_guide_ids.append_value(guide_ids.value(g));
+                    out_target_genes.append_null();
                     out_umi_counts.append_value(count);
                     out_confidence.append_value(1.0);
                     out_is_unassigned.append_value(false);
                     out_is_multi.append_value(true);
+                    for &(ag, _) in &above {
+                        assigned_triples.push((cell, ag));
+                    }
                 }
             }
         }
 
         let model_name_arr: DictionaryArray<arrow::datatypes::Int8Type> = {
             let values = StringArray::from(vec![self.name()]);
-            let keys = arrow::array::Int8Array::from(vec![0i8; n]);
-            DictionaryArray::try_new(keys, std::sync::Arc::new(values))
+            let keys = arrow::array::Int8Array::from(vec![0i8; n_cells]);
+            DictionaryArray::try_new(keys, Arc::new(values))
                 .context("failed to build assignment_model dictionary")?
         };
 
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             assignment_schema_ref(),
             vec![
-                std::sync::Arc::new(StringArray::from(out_barcodes)),
-                std::sync::Arc::new(out_guide_ids.finish()),
-                std::sync::Arc::new(out_target_genes.finish()),
-                std::sync::Arc::new(out_umi_counts.finish()),
-                std::sync::Arc::new(out_confidence.finish()),
-                std::sync::Arc::new(model_name_arr),
-                std::sync::Arc::new(out_is_unassigned.finish()),
-                std::sync::Arc::new(out_is_multi.finish()),
-                std::sync::Arc::new(out_n_detected.finish()),
+                Arc::new(cell_barcodes.clone()),
+                Arc::new(out_guide_ids.finish()),
+                Arc::new(out_target_genes.finish()),
+                Arc::new(out_umi_counts.finish()),
+                Arc::new(out_confidence.finish()),
+                Arc::new(model_name_arr),
+                Arc::new(out_is_unassigned.finish()),
+                Arc::new(out_is_multi.finish()),
+                Arc::new(out_n_detected.finish()),
             ],
         )
-        .context("failed to build output RecordBatch")
+        .context("failed to build output RecordBatch")?;
+
+        assigned_triples.sort_unstable();
+        assigned_triples.dedup();
+        let assigned_x = build_assigned_csr(assigned_triples, n_cells, n_guides);
+
+        Ok(AssignmentResult { batch, assigned_x })
     }
 
     fn params_json(&self) -> Value {
@@ -162,80 +133,171 @@ impl AssignmentModel for UmiModel {
     }
 }
 
+fn build_assigned_csr(triples: Vec<(usize, usize)>, n_cells: usize, n_guides: usize) -> CsrMatrix<u8> {
+    let nnz = triples.len();
+    let mut row_offsets = vec![0usize; n_cells + 1];
+    let mut col_indices = Vec::with_capacity(nnz);
+    let mut last = 0usize;
+    for (idx, &(r, c)) in triples.iter().enumerate() {
+        while last < r { row_offsets[last + 1] = idx; last += 1; }
+        col_indices.push(c);
+    }
+    for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
+    CsrMatrix::try_from_csr_data(n_cells, n_guides, row_offsets, col_indices, vec![1u8; nnz])
+        .expect("assigned CSR from sorted unique triples cannot fail")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{BooleanArray, StringArray, UInt32Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use std::sync::Arc;
+    use crate::data::{CountMatrix, Covariates, GuideMetadata};
+    use arrow::array::{BooleanArray, Float32Array, StringBuilder};
 
-    fn make_counts(rows: Vec<(&str, &str, u32)>) -> RecordBatch {
-        let schema = Schema::new(vec![
-            Field::new("cell_barcode", DataType::Utf8, false),
-            Field::new("guide_id", DataType::Utf8, false),
-            Field::new("umi_count", DataType::UInt32, false),
-        ]);
-        let barcodes = StringArray::from(rows.iter().map(|(b, _, _)| *b).collect::<Vec<_>>());
-        let guides = StringArray::from(rows.iter().map(|(_, g, _)| *g).collect::<Vec<_>>());
-        let counts = UInt32Array::from(rows.iter().map(|(_, _, c)| *c).collect::<Vec<_>>());
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(barcodes), Arc::new(guides), Arc::new(counts)],
-        )
-        .unwrap()
+    fn make_input(n_cells: usize, n_guides: usize, triples: Vec<(usize, usize, u32)>) -> LoadedInput {
+        let mut sorted = triples;
+        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
+        let nnz = sorted.len();
+        let mut row_offsets = vec![0usize; n_cells + 1];
+        let mut col_indices = Vec::with_capacity(nnz);
+        let mut values = Vec::with_capacity(nnz);
+        let mut last = 0usize;
+        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
+            while last < r { row_offsets[last + 1] = idx; last += 1; }
+            col_indices.push(c);
+            values.push(v);
+        }
+        for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
+        let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
+
+        let mut bc = StringBuilder::new();
+        for i in 0..n_cells { bc.append_value(format!("C{i}")); }
+        let mut gd = StringBuilder::new();
+        for i in 0..n_guides { gd.append_value(format!("g{i}")); }
+
+        LoadedInput {
+            counts,
+            covariates: Covariates {
+                cell_barcodes: bc.finish(),
+                total_counts: Float32Array::from(vec![0.0f32; n_cells]),
+            },
+            guide_metadata: GuideMetadata { guide_ids: gd.finish() },
+        }
     }
 
-    fn empty_covariates() -> RecordBatch {
-        let schema = Schema::new(vec![
-            Field::new("cell_barcode", DataType::Utf8, false),
-            Field::new("batch", DataType::Utf8, false),
-            Field::new("total_counts", DataType::Float32, false),
-        ]);
-        RecordBatch::new_empty(Arc::new(schema))
+    fn is_unassigned(r: &AssignmentResult) -> &BooleanArray {
+        r.batch.column_by_name("is_unassigned").unwrap()
+            .as_any().downcast_ref::<BooleanArray>().unwrap()
     }
 
     #[test]
     fn single_guide_above_threshold() {
-        let model = UmiModel::default();
-        let counts = make_counts(vec![("CELL1", "guide_A", 10), ("CELL1", "guide_B", 1)]);
-        let input = AssignmentInput { counts, covariates: empty_covariates() };
-        let result = model.assign(&input).unwrap();
-
-        assert_eq!(result.num_rows(), 1);
-        let is_unassigned = result
-            .column_by_name("is_unassigned").unwrap()
+        let input = make_input(1, 2, vec![(0, 0, 10), (0, 1, 1)]);
+        let result = UmiModel::default().assign(&input).unwrap();
+        let isu = is_unassigned(&result);
+        let is_multi = result.batch.column_by_name("is_multi_infected").unwrap()
             .as_any().downcast_ref::<BooleanArray>().unwrap();
-        let is_multi = result
-            .column_by_name("is_multi_infected").unwrap()
-            .as_any().downcast_ref::<BooleanArray>().unwrap();
-
-        assert!(!is_unassigned.value(0));
+        assert!(!isu.value(0));
         assert!(!is_multi.value(0));
     }
 
     #[test]
     fn no_guides_above_threshold_is_unassigned() {
-        let model = UmiModel::default();
-        let counts = make_counts(vec![("CELL1", "guide_A", 2), ("CELL1", "guide_B", 1)]);
-        let input = AssignmentInput { counts, covariates: empty_covariates() };
-        let result = model.assign(&input).unwrap();
-
-        let is_unassigned = result
-            .column_by_name("is_unassigned").unwrap()
-            .as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(is_unassigned.value(0));
+        let input = make_input(1, 2, vec![(0, 0, 2), (0, 1, 1)]);
+        let result = UmiModel::default().assign(&input).unwrap();
+        assert!(is_unassigned(&result).value(0));
     }
 
     #[test]
     fn two_guides_above_threshold_is_multi() {
-        let model = UmiModel::default();
-        let counts = make_counts(vec![("CELL1", "guide_A", 10), ("CELL1", "guide_B", 8)]);
-        let input = AssignmentInput { counts, covariates: empty_covariates() };
-        let result = model.assign(&input).unwrap();
-
-        let is_multi = result
-            .column_by_name("is_multi_infected").unwrap()
+        let input = make_input(1, 2, vec![(0, 0, 10), (0, 1, 8)]);
+        let result = UmiModel::default().assign(&input).unwrap();
+        let is_multi = result.batch.column_by_name("is_multi_infected").unwrap()
             .as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(is_multi.value(0));
+    }
+
+    #[test]
+    fn multi_assigns_to_highest_umi() {
+        let input = make_input(1, 2, vec![(0, 0, 10), (0, 1, 8)]);
+        let result = UmiModel::default().assign(&input).unwrap();
+        use arrow::array::{DictionaryArray, StringArray as SA};
+        use arrow::datatypes::Int16Type;
+        let dict = result.batch.column_by_name("guide_id").unwrap()
+            .as_any().downcast_ref::<DictionaryArray<Int16Type>>().unwrap();
+        let vals = dict.values().as_any().downcast_ref::<SA>().unwrap();
+        let key = dict.keys().value(0) as usize;
+        assert_eq!(vals.value(key), "g0"); // g0 has count 10 > g1 count 8
+    }
+
+    #[test]
+    fn assigned_x_covers_all_above_threshold_for_multi() {
+        // both guides above threshold → both in assigned_x
+        let input = make_input(1, 2, vec![(0, 0, 10), (0, 1, 8)]);
+        let result = UmiModel::default().assign(&input).unwrap();
+        assert_eq!(result.assigned_x.get_row(0).unwrap().nnz(), 2);
+    }
+
+    #[test]
+    fn n_detected_counts_above_threshold() {
+        let input = make_input(1, 3, vec![(0, 0, 10), (0, 1, 8), (0, 2, 2)]);
+        let result = UmiModel::default().assign(&input).unwrap();
+        use arrow::array::UInt8Array;
+        let n_det = result.batch.column_by_name("n_guides_detected").unwrap()
+            .as_any().downcast_ref::<UInt8Array>().unwrap();
+        assert_eq!(n_det.value(0), 2); // g0=10 and g1=8 above threshold=5; g2=2 below
+    }
+
+    #[test]
+    fn empty_matrix_produces_empty_result() {
+        let input = make_input(0, 0, vec![]);
+        let result = UmiModel::default().assign(&input).unwrap();
+        assert_eq!(result.batch.num_rows(), 0);
+    }
+
+    #[test]
+    fn custom_threshold_zero_assigns_any_nonzero() {
+        let model = UmiModel { umi_threshold: 1 };
+        let input = make_input(1, 2, vec![(0, 0, 1)]);
+        let result = model.assign(&input).unwrap();
+        assert!(!is_unassigned(&result).value(0));
+    }
+
+    #[test]
+    fn count_exactly_at_threshold_is_assigned() {
+        // Filter is >=, so count == umi_threshold must pass.
+        let model = UmiModel { umi_threshold: 5 };
+        let input = make_input(1, 1, vec![(0, 0, 5)]);
+        let result = model.assign(&input).unwrap();
+        assert!(!is_unassigned(&result).value(0));
+    }
+
+    #[test]
+    fn count_one_below_threshold_is_unassigned() {
+        let model = UmiModel { umi_threshold: 5 };
+        let input = make_input(1, 1, vec![(0, 0, 4)]);
+        let result = model.assign(&input).unwrap();
+        assert!(is_unassigned(&result).value(0));
+    }
+
+    #[test]
+    fn n_detected_zero_for_unassigned_cell() {
+        let input = make_input(1, 2, vec![(0, 0, 1), (0, 1, 1)]); // both below threshold=5
+        let result = UmiModel::default().assign(&input).unwrap();
+        use arrow::array::UInt8Array;
+        let n_det = result.batch.column_by_name("n_guides_detected").unwrap()
+            .as_any().downcast_ref::<UInt8Array>().unwrap();
+        assert!(is_unassigned(&result).value(0));
+        assert_eq!(n_det.value(0), 0);
+    }
+
+    #[test]
+    fn unassigned_columns_are_null() {
+        use arrow::array::Array;
+        let input = make_input(1, 2, vec![(0, 0, 1)]); // below threshold=5
+        let result = UmiModel::default().assign(&input).unwrap();
+        assert!(is_unassigned(&result).value(0));
+        assert!(result.batch.column_by_name("guide_id").unwrap().is_null(0));
+        assert!(result.batch.column_by_name("umi_count").unwrap().is_null(0));
+        assert!(result.batch.column_by_name("assignment_confidence").unwrap().is_null(0));
     }
 }

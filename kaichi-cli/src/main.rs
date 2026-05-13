@@ -16,13 +16,13 @@ struct Cli {
 enum Commands {
     /// Assign CRISPR guides to cells
     Assign {
-        /// Input H5AD file (guide count matrix)
+        /// Input: guide-count H5AD
         #[arg(long)]
         counts: PathBuf,
         /// Assignment model
         #[arg(long, default_value = "poisson_gauss")]
         model: String,
-        /// Output CSV file: cell, gRNA, UMI_counts (omit to run without writing)
+        /// Output path (.h5ad or .csv)
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -34,29 +34,26 @@ fn main() -> Result<()> {
         Commands::Assign { counts, model, output } => {
             eprintln!("reading {}", counts.display());
             let t0 = Instant::now();
-            let loaded = kaichi_core::io::h5ad::read_h5ad(&counts)?;
-            let input = loaded.input;
-            let var_names = loaded.var_names;
-            let n_cells = input.covariates.num_rows();
-            let n_nnz = input.counts.num_rows();
-            eprintln!("loaded {n_cells} cells, {n_nnz} non-zero entries in {:.2}s", t0.elapsed().as_secs_f64());
+            let input = kaichi_core::io::read::read_h5ad(&counts)?;
+            eprintln!(
+                "loaded {} cells × {} guides ({} nnz) in {:.2}s",
+                input.counts.n_cells,
+                input.counts.n_guides,
+                input.counts.nnz(),
+                t0.elapsed().as_secs_f64()
+            );
 
             eprintln!("running model: {model}");
             let t1 = Instant::now();
             let result = run_model(&model, &input)?;
-            eprintln!("assigned {} cells in {:.2}s", result.num_rows(), t1.elapsed().as_secs_f64());
+            eprintln!("assigned {} cells in {:.2}s", result.batch.num_rows(), t1.elapsed().as_secs_f64());
 
             if let Some(out_path) = output {
                 match out_path.extension().and_then(|e| e.to_str()) {
                     Some("h5ad") => {
-                        let obs_names: Vec<String> = {
-                            use arrow::array::{Array, StringArray};
-                            let col = input.covariates.column_by_name("cell_barcode").unwrap();
-                            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                            (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
-                        };
-                        kaichi_core::io::write_h5ad::write_h5ad(
-                            &input, &result, &obs_names, &var_names, &out_path, &model,
+                        let params = run_model_params(&model, &input)?;
+                        kaichi_core::io::write::write_h5ad(
+                            &input, &result, &out_path, &model, &params,
                         )?;
                     }
                     _ => write_csv(&result, &out_path)?,
@@ -70,8 +67,8 @@ fn main() -> Result<()> {
 
 fn run_model(
     name: &str,
-    input: &kaichi_core::models::AssignmentInput,
-) -> Result<arrow::record_batch::RecordBatch> {
+    input: &kaichi_core::data::LoadedInput,
+) -> Result<kaichi_core::data::AssignmentResult> {
     use kaichi_core::models::AssignmentModel;
     match name {
         "umi"           => kaichi_core::models::umi::UmiModel::default().assign(input),
@@ -82,13 +79,26 @@ fn run_model(
     }
 }
 
-fn write_csv(batch: &arrow::record_batch::RecordBatch, path: &std::path::Path) -> Result<()> {
+fn run_model_params(name: &str, _input: &kaichi_core::data::LoadedInput) -> Result<String> {
+    use kaichi_core::models::AssignmentModel;
+    let v = match name {
+        "umi"           => kaichi_core::models::umi::UmiModel::default().params_json(),
+        "max"           => kaichi_core::models::max::MaxModel::default().params_json(),
+        "ratio"         => kaichi_core::models::ratio::RatioModel::default().params_json(),
+        "poisson_gauss" => kaichi_core::models::poisson_gauss::PoissonGaussModel::default().params_json(),
+        other           => bail!("unknown model: {other}"),
+    };
+    Ok(v.to_string())
+}
+
+fn write_csv(result: &kaichi_core::data::AssignmentResult, path: &std::path::Path) -> Result<()> {
     use arrow::array::{Array, BooleanArray, StringArray, UInt32Array};
     use arrow::compute::cast;
     use arrow::datatypes::DataType;
     use std::fs::File;
     use std::io::{BufWriter, Write};
 
+    let batch = &result.batch;
     let barcodes = batch.column_by_name("cell_barcode").unwrap()
         .as_any().downcast_ref::<StringArray>().unwrap();
     let guide_col = cast(batch.column_by_name("guide_id").unwrap().as_ref(), &DataType::Utf8)?;

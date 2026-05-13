@@ -1,27 +1,17 @@
-use arrow::record_batch::RecordBatch;
+use crate::data::{AssignmentResult, LoadedInput};
 use anyhow::Result;
 use serde_json::Value;
 
-pub mod umi;
 pub mod max;
-pub mod ratio;
 pub mod poisson_gauss;
-
-/// Input to all assignment models: the sparse count matrix plus per-cell covariates,
-/// both represented as Arrow RecordBatches.
-///
-/// `counts` schema: (cell_barcode: Utf8, guide_id: Utf8, umi_count: UInt32) — long form.
-/// `covariates` schema: (cell_barcode: Utf8, batch: Utf8, total_counts: Float32).
-pub struct AssignmentInput {
-    pub counts: RecordBatch,
-    pub covariates: RecordBatch,
-}
+pub mod ratio;
+pub mod umi;
 
 pub trait AssignmentModel: Send + Sync {
     fn name(&self) -> &'static str;
 
-    /// Run the model and return one row per cell in the assignment schema.
-    fn assign(&self, input: &AssignmentInput) -> Result<RecordBatch>;
+    /// Run the model and return an `AssignmentResult`.
+    fn assign(&self, input: &LoadedInput) -> Result<AssignmentResult>;
 
     /// Parameters as JSON, recorded in uns['kaichi']['model_params'].
     fn params_json(&self) -> Value;

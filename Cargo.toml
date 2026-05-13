@@ -17,9 +17,8 @@ license = "MIT"
 # Arrow
 arrow = { version = "53", features = ["prettyprint"] }
 
-# AnnData I/O
-anndata = { git = "https://github.com/scverse/anndata-rs", rev = "cf0b312f2834884bd708595a63f12f34f1905b7b" }
-anndata-hdf5 = { git = "https://github.com/scverse/anndata-rs", rev = "cf0b312f2834884bd708595a63f12f34f1905b7b" }
+# HDF5 I/O
+hdf5 = { package = "hdf5-metno", version = "0.12" }
 
 # Numerics
 ndarray = "0.17"
@@ -36,8 +35,6 @@ thiserror = "2"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-polars = { version = "0.53", features = ["lazy", "ndarray", "dtype-full"] }
 
 # Testing
 approx = "0.5"

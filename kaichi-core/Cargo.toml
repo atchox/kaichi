@@ -7,16 +7,13 @@ license.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
+hdf5 = { workspace = true }
 ndarray = { workspace = true }
 statrs = { workspace = true }
 rayon = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-anndata = { workspace = true }
-anndata-hdf5 = { workspace = true }
-polars = { workspace = true }
 nalgebra-sparse = { workspace = true }
 
 [dev-dependencies]
