@@ -67,13 +67,11 @@ kaichi --help
 kaichi --version
 
 kaichi assign \
-    --counts <PATH>            # Cell Ranger dir, molecule_info.h5, h5ad, or h5mu
-    --output <PATH>            # .h5mu, .h5ad
+    --counts <PATH>            # Cell Ranger MEX dir, .h5ad (guides), or .h5mu
+    --output <PATH>            # .h5mu, .h5ad, or .csv
     --model <NAME>             # umi, max, ratio, neg_binomial, poisson_gauss, ...
     [--guide-library <TSV>]    # optional guide metadata / validation
-    [--input <PATH>]           # existing h5ad / h5mu to attach the crispr modality to
     [--params <JSON or @file>] # model-specific overrides
-    [--barcode-join inner|left|outer]  # default: inner
     [--threads N]              # default: all available
     [--seed N]                 # default: 2024
     [--verbose / -v]
@@ -139,11 +137,13 @@ AnnData (guide-only).
 If `--guide-library` is omitted, `.var` is built from guide IDs observed in the count
 input. If it is provided, `.var` is enriched with the TSV metadata.
 
-If `--input` is provided, the input file's RNA modality is included in the
-output via structural HDF5 copy (see [storage-encoding.md](storage-encoding.md)).
+Whether RNA appears in the output depends entirely on `--counts`:
+- MEX with Gene Expression rows or H5MU input → RNA is included
+- MEX with CRISPR-only or guide-only H5AD → guide-only output
 
-If `--input` is omitted and `--output` is `.h5mu`, the file contains only
-`mod['crispr']`. That's valid MuData, just minimal.
+kaichi has no flag for attaching RNA from a separate file. To combine RNA and
+guides from different sources, assemble them into an H5MU upstream (e.g., with
+`muon` or `scx convert`) and pass that to `--counts`.
 
 ---
 
@@ -198,7 +198,6 @@ with cores until guide count saturates available threads.
 rule kaichi_assign:
     input:
         counts = "data/cellranger/{sample}/filtered_feature_bc_matrix/",
-        rna = "data/rna/{sample}.h5ad",
         guides = "config/guide_library.tsv",
     output:
         h5mu = "results/{sample}.h5mu",
@@ -212,7 +211,6 @@ rule kaichi_assign:
         "kaichi assign "
         "  --counts {input.counts} "
         "  --guide-library {input.guides} "
-        "  --input {input.rna} "
         "  --output {output.h5mu} "
         "  --model {params.model} "
         "  --params '{params.model_params}' "

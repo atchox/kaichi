@@ -51,8 +51,8 @@ Optional guide library TSV
 │  - UMI deduplication (molecule_info)    │
 │  - assignment model execution           │
 │  - per-guide rayon parallelism          │
-│  - H5AD I/O via anndata-rs              │
-│  - H5MU container written directly      │
+│  - H5AD / H5MU I/O via hdf5-metno       │
+│    (AnnData spec implemented in-tree)   │
 │  - structural pass-through via H5Ocopy  │
 │  - returns Arrow RecordBatch to bindings│
 └────────────────┬────────────────────────┘
@@ -93,9 +93,8 @@ source package (rextendr) from the same `kaichi-core` version.
 | Interop | Apache Arrow (`arrow` crate) | Zero-copy handoff to Python/R |
 | Numerics | `ndarray`, `statrs`, `argmin` | Mature, no autodiff overhead |
 | Parallelism | `rayon` | Embarrassingly parallel across guides |
-| HDF5 raw access | `hdf5` crate | For H5Ocopy structural pass-through |
-| AnnData I/O | `anndata-rs` (git-pinned, vendored if needed) | Spec-correct AnnData reading/writing |
-| H5MU container | written directly via `hdf5` | anndata-rs does not support MuData |
+| HDF5 access | `hdf5-metno` | Single backend for all I/O (H5AD, H5MU, H5Ocopy, molecule_info.h5) |
+| AnnData / MuData spec | implemented in-tree in `kaichi-core/src/io/` | No git-pinned anndata-rs dep; H5MU and subgroup writes need direct HDF5 anyway |
 | CLI | `clap` + `tracing` + `indicatif` | Standalone Rust binary |
 | Python binding | `pyo3` + `pyo3-arrow` + `maturin` | Standard, pip-wheel compatible |
 | R binding | `extendr` + arrow R package | Same path as rpolars |
@@ -107,7 +106,7 @@ source package (rextendr) from the same `kaichi-core` version.
 - Input/output formats, API sketches → [io-spec.md](io-spec.md)
 - Arrow schema, MuData / Seurat structure → [data-model.md](data-model.md)
 - Model catalog → [assignment-models.md](assignment-models.md)
-- HDF5 read/write, anndata-rs use, structural copy → [storage-encoding.md](storage-encoding.md)
+- HDF5 read/write, AnnData spec implementation, structural copy → [storage-encoding.md](storage-encoding.md)
 - Arrow handoff between Rust and Python/R → [binding-interop.md](binding-interop.md)
 - Standalone CLI design → [cli.md](cli.md)
 - Validation against baselines, ship criteria → [validation.md](validation.md)
