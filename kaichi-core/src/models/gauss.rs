@@ -6,16 +6,15 @@ use crate::data::{AssignmentResult, LoadedInput};
 use anyhow::Result;
 use rayon::prelude::*;
 use serde_json::{json, Value};
-use statrs::function::gamma::ln_gamma;
 
-/// Per-guide Poisson-Gaussian mixture model on raw UMI counts.
+/// Assign each cell to a guide via a two-component tied-variance Gaussian mixture
+/// fitted on log10(UMI + 1) per guide.
 ///
-/// Background counts ~ Poisson(λ) on raw UMIs. Signal counts ~ N(μ, σ²) on
-/// raw UMIs. Each guide is fit independently via closed-form EM over all cells,
-/// including zeros (which are valid Poisson background observations). An integer
-/// UMI threshold is derived as the first count where the signal posterior exceeds
+/// Background: N(μ_bg, σ²). Signal: N(μ_signal, σ²). Shared σ (tied variance).
+/// Every cell contributes to the EM (zeros as log10(1) = 0.0, handled analytically).
+/// A raw-count threshold is derived as the first count whose signal posterior exceeds
 /// `min_confidence`.
-pub struct PoissonGaussModel {
+pub struct GaussModel {
     pub min_confidence: f32,
     pub max_em_iters: u32,
     pub tol: f32,
@@ -23,7 +22,7 @@ pub struct PoissonGaussModel {
     pub min_max_count: u32,
 }
 
-impl Default for PoissonGaussModel {
+impl Default for GaussModel {
     fn default() -> Self {
         Self {
             min_confidence: 0.5,
@@ -38,14 +37,14 @@ impl Default for PoissonGaussModel {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FitParams {
     pi: f64,
-    lambda_bg: f64,
+    mu_bg: f64,
     mu_signal: f64,
-    sigma_signal: f64,
+    sigma: f64,
 }
 
-impl AssignmentModel for PoissonGaussModel {
+impl AssignmentModel for GaussModel {
     fn name(&self) -> &'static str {
-        "poisson_gauss"
+        "gauss"
     }
 
     fn assign(&self, input: &LoadedInput) -> Result<AssignmentResult> {
@@ -63,11 +62,10 @@ impl AssignmentModel for PoissonGaussModel {
             })
             .collect();
 
-        // Step 2: iterate cells in CSR row order, applying stored FitParams.
+        // Step 2: per-cell scoring via CSR.
         let csr = input.counts.csr();
         let guide_ids_arr = &input.guide_metadata.guide_ids;
         let cell_barcodes = &input.covariates.cell_barcodes;
-
         let mut out = AssignmentOutputBuilder::new(n_cells, n_guides, self.name());
 
         for cell in 0..n_cells {
@@ -77,15 +75,17 @@ impl AssignmentModel for PoissonGaussModel {
 
             for (&guide_idx, &count) in row.col_indices().iter().zip(row.values().iter()) {
                 let Some((threshold, params)) = guide_fits[guide_idx] else { continue };
-                if count < threshold { continue }
-
-                let posterior = posterior_signal(count as f64, params) as f32;
+                if count < threshold {
+                    continue;
+                }
+                let x = (count as f64 + 1.0).log10();
+                let posterior = posterior_signal(x, params) as f32;
                 if posterior >= self.min_confidence {
                     n_passing += 1;
                     match best {
                         None => best = Some((guide_idx, posterior, count)),
-                        Some((_, best_post, best_count)) => {
-                            if posterior > best_post || (posterior == best_post && count > best_count) {
+                        Some((_, bp, bc)) => {
+                            if posterior > bp || (posterior == bp && count > bc) {
                                 best = Some((guide_idx, posterior, count));
                             }
                         }
@@ -109,8 +109,6 @@ impl AssignmentModel for PoissonGaussModel {
             }
         }
 
-        // Every passing guide was pushed in CSR row order (guide-index sorted),
-        // exactly once per (cell, guide). Triples are already strictly sorted.
         out.finish(cell_barcodes, true)
     }
 
@@ -125,13 +123,7 @@ impl AssignmentModel for PoissonGaussModel {
     }
 }
 
-impl PoissonGaussModel {
-    /// Fit EM for one guide and return `(threshold, FitParams)`, or `None` if
-    /// the guide has too few observations to fit reliably.
-    ///
-    /// `nonzero_counts` are the non-zero UMI values from the guide's CSC column.
-    /// `n_zeros` is the number of cells with zero counts for this guide; they are
-    /// included analytically in the EM updates as Poisson background observations.
+impl GaussModel {
     fn fit_guide(&self, nonzero_counts: &[u32], n_zeros: usize) -> Option<(u32, FitParams)> {
         let n_nonzero = nonzero_counts.iter().filter(|&&c| c > 0).count() as u32;
         let max_count = nonzero_counts.iter().copied().max().unwrap_or(0);
@@ -140,15 +132,16 @@ impl PoissonGaussModel {
             return None;
         }
 
-        let raw_counts: Vec<f64> = nonzero_counts.iter()
+        let log_vals: Vec<f64> = nonzero_counts
+            .iter()
             .filter(|&&c| c > 0)
-            .map(|&c| c as f64)
+            .map(|&c| (c as f64 + 1.0).log10())
             .collect();
 
-        let params = fit_mixture(&raw_counts, n_zeros, self.max_em_iters, self.tol as f64);
+        let params = fit_mixture(&log_vals, n_zeros, self.max_em_iters, self.tol as f64);
 
         let threshold = (1..=max_count)
-            .find(|&c| posterior_signal(c as f64, params) > self.min_confidence as f64)?;
+            .find(|&c| posterior_signal((c as f64 + 1.0).log10(), params) > self.min_confidence as f64)?;
 
         Some((threshold, params))
     }
@@ -158,91 +151,87 @@ impl PoissonGaussModel {
 // EM
 // ---------------------------------------------------------------------------
 
-/// EM on a Poisson-Gaussian mixture over raw UMI counts.
+/// EM on a tied-variance two-component Gaussian mixture over log10(UMI + 1).
 ///
-/// `nonzero_vals`: non-zero UMI counts as f64.
-/// `n_zeros`: number of cells with zero counts for this guide, included
-///            analytically so zeros don't need to be materialised.
-fn fit_mixture(nonzero_vals: &[f64], n_zeros: usize, max_em_iters: u32, tol: f64) -> FitParams {
-    let init = initialize_params(nonzero_vals, n_zeros);
-    let mut responsibilities = vec![0.0f64; nonzero_vals.len()];
+/// `log_vals`: log10(count + 1) for nonzero UMI observations.
+/// `n_zeros`: cells with zero counts (log10(1) = 0.0), handled analytically.
+fn fit_mixture(log_vals: &[f64], n_zeros: usize, max_em_iters: u32, tol: f64) -> FitParams {
+    let init = initialize_params(log_vals, n_zeros);
+    let mut responsibilities = vec![0.0f64; log_vals.len()];
 
-    run_em(init, |params| {
-        let mut log_lik = 0.0;
-        for (idx, &x) in nonzero_vals.iter().enumerate() {
-            let log_bg = (1.0 - params.pi).ln() + log_poisson_pmf(x, params.lambda_bg);
-            let log_sig = params.pi.ln() + log_normal_pdf(x, params.mu_signal, params.sigma_signal);
-            let denom = logsumexp2(log_bg, log_sig);
-            responsibilities[idx] = (log_sig - denom).exp();
-            log_lik += denom;
-        }
-        let log_bg_zero = (1.0 - params.pi).ln() + log_poisson_pmf(0.0, params.lambda_bg);
-        let log_sig_zero = params.pi.ln() + log_normal_pdf(0.0, params.mu_signal, params.sigma_signal);
-        let denom_zero = logsumexp2(log_bg_zero, log_sig_zero);
-        let r_zero = (log_sig_zero - denom_zero).exp();
-        log_lik += n_zeros as f64 * denom_zero;
-        let new_params = m_step(nonzero_vals, &responsibilities, n_zeros, r_zero);
-        (new_params, log_lik)
-    }, max_em_iters, tol)
+    run_em(
+        init,
+        |params| {
+            let mut log_lik = 0.0;
+            for (idx, &x) in log_vals.iter().enumerate() {
+                let log_bg = (1.0 - params.pi).ln() + log_normal_pdf(x, params.mu_bg, params.sigma);
+                let log_sig = params.pi.ln() + log_normal_pdf(x, params.mu_signal, params.sigma);
+                let denom = logsumexp2(log_bg, log_sig);
+                responsibilities[idx] = (log_sig - denom).exp();
+                log_lik += denom;
+            }
+            // Zeros: log10(0 + 1) = 0.0; all identical, one shared responsibility.
+            let log_bg_z = (1.0 - params.pi).ln() + log_normal_pdf(0.0, params.mu_bg, params.sigma);
+            let log_sig_z = params.pi.ln() + log_normal_pdf(0.0, params.mu_signal, params.sigma);
+            let denom_z = logsumexp2(log_bg_z, log_sig_z);
+            let r_zero = (log_sig_z - denom_z).exp();
+            log_lik += n_zeros as f64 * denom_z;
+            let new_params = m_step(log_vals, &responsibilities, n_zeros, r_zero);
+            (new_params, log_lik)
+        },
+        max_em_iters,
+        tol,
+    )
 }
 
-fn initialize_params(nonzero_vals: &[f64], n_zeros: usize) -> FitParams {
-    let mut sorted = nonzero_vals.to_vec();
+fn initialize_params(log_vals: &[f64], n_zeros: usize) -> FitParams {
+    let mut sorted = log_vals.to_vec();
     sorted.sort_by(f64::total_cmp);
     let threshold_idx = ((sorted.len() as f64) * 0.9).floor() as usize;
     let threshold = sorted[threshold_idx.min(sorted.len() - 1)];
-    let resp: Vec<f64> = nonzero_vals.iter().map(|&v| if v >= threshold { 1.0 } else { 0.0 }).collect();
-    m_step(nonzero_vals, &resp, n_zeros, 0.0)
+    let resp: Vec<f64> = log_vals.iter().map(|&v| if v >= threshold { 1.0 } else { 0.0 }).collect();
+    m_step(log_vals, &resp, n_zeros, 0.0)
 }
 
-/// M-step with zeros included analytically.
-///
-/// `r_zero` is the signal responsibility for a single zero cell.
-fn m_step(nonzero_vals: &[f64], responsibilities: &[f64], n_zeros: usize, r_zero: f64) -> FitParams {
-    let sum_r_nonzero: f64 = responsibilities.iter().sum();
-    let sum_r_zeros = n_zeros as f64 * r_zero;
-    let sum_r = sum_r_nonzero + sum_r_zeros;
-    let n_total = nonzero_vals.len() as f64 + n_zeros as f64;
+/// M-step for tied-variance Gaussian mixture with analytic zeros.
+fn m_step(log_vals: &[f64], responsibilities: &[f64], n_zeros: usize, r_zero: f64) -> FitParams {
+    let n_total = log_vals.len() as f64 + n_zeros as f64;
 
+    let sum_r_nz: f64 = responsibilities.iter().sum();
+    let sum_r = sum_r_nz + n_zeros as f64 * r_zero;
     let pi = clamp_probability(sum_r / n_total);
 
-    // Poisson background MLE: weighted mean of all counts (zeros contribute 0 to numerator).
-    let lambda_num: f64 = nonzero_vals.iter().zip(responsibilities)
-        .map(|(&x, &r)| (1.0 - r) * x).sum();
-    let lambda_denom = n_total - sum_r;
-    let lambda_bg = (lambda_num / lambda_denom.max(1e-6)).max(1e-6);
-
-    // Gaussian signal MLE.
-    let mu_num: f64 = nonzero_vals.iter().zip(responsibilities)
-        .map(|(&x, &r)| r * x).sum::<f64>();
-    // Zeros contribute r_zero * 0.0 = 0 to mu numerator.
+    // Signal mean: zeros contribute 0.0 * r_zero = 0 to the numerator.
+    let mu_signal_num: f64 = log_vals.iter().zip(responsibilities).map(|(&x, &r)| r * x).sum();
     let mu_signal = if sum_r > 1e-6 {
-        mu_num / sum_r
+        mu_signal_num / sum_r
     } else {
-        nonzero_vals.iter().copied().fold(0.0_f64, f64::max)
+        log_vals.iter().copied().fold(0.0_f64, f64::max)
     };
 
-    let var_num: f64 = nonzero_vals.iter().zip(responsibilities)
-        .map(|(&x, &r)| r * (x - mu_signal).powi(2)).sum::<f64>()
-        + n_zeros as f64 * r_zero * mu_signal.powi(2); // zero cells: (0 - mu)²
-    let sigma_signal = (var_num / sum_r.max(1e-6)).sqrt().max(1.0);
+    // Background mean: zeros contribute 0.0 * (1 - r_zero) = 0 to the numerator.
+    let sum_r_bg = n_total - sum_r;
+    let mu_bg_num: f64 = log_vals.iter().zip(responsibilities).map(|(&x, &r)| (1.0 - r) * x).sum();
+    let mu_bg = if sum_r_bg > 1e-6 { mu_bg_num / sum_r_bg } else { 0.0 };
 
-    FitParams { pi, lambda_bg, mu_signal, sigma_signal }
+    // Tied variance: pooled across both components over all observations.
+    let var_num: f64 = log_vals
+        .iter()
+        .zip(responsibilities)
+        .map(|(&x, &r)| r * (x - mu_signal).powi(2) + (1.0 - r) * (x - mu_bg).powi(2))
+        .sum::<f64>()
+        + n_zeros as f64
+            * (r_zero * mu_signal.powi(2) + (1.0 - r_zero) * mu_bg.powi(2));
+    let sigma = (var_num / n_total.max(1.0)).sqrt().max(0.1);
+
+    FitParams { pi, mu_bg, mu_signal, sigma }
 }
-
-// ---------------------------------------------------------------------------
-// Math helpers
-// ---------------------------------------------------------------------------
 
 fn posterior_signal(x: f64, params: FitParams) -> f64 {
-    let log_bg = (1.0 - params.pi).ln() + log_poisson_pmf(x, params.lambda_bg);
-    let log_sig = params.pi.ln() + log_normal_pdf(x, params.mu_signal, params.sigma_signal);
+    let log_bg = (1.0 - params.pi).ln() + log_normal_pdf(x, params.mu_bg, params.sigma);
+    let log_sig = params.pi.ln() + log_normal_pdf(x, params.mu_signal, params.sigma);
     let denom = logsumexp2(log_bg, log_sig);
     (log_sig - denom).exp()
-}
-
-fn log_poisson_pmf(x: f64, lambda: f64) -> f64 {
-    x * lambda.ln() - lambda - ln_gamma(x + 1.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -261,13 +250,12 @@ mod tests {
         triples: Vec<(usize, usize, u32)>,
         cell_names: &[&str],
         guide_names: &[&str],
-    ) -> LoadedInput {
+    ) -> crate::data::LoadedInput {
         assert_eq!(cell_names.len(), n_cells);
         assert_eq!(guide_names.len(), n_guides);
 
         let mut sorted = triples;
         sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
-
         let nnz = sorted.len();
         let mut row_offsets = vec![0usize; n_cells + 1];
         let mut col_indices = Vec::with_capacity(nnz);
@@ -286,13 +274,12 @@ mod tests {
         }
 
         let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
-
         let mut bc = StringBuilder::new();
         cell_names.iter().for_each(|s| bc.append_value(s));
         let mut gd = StringBuilder::new();
         guide_names.iter().for_each(|s| gd.append_value(s));
 
-        LoadedInput {
+        crate::data::LoadedInput {
             counts,
             covariates: Covariates {
                 cell_barcodes: bc.finish(),
@@ -302,8 +289,8 @@ mod tests {
         }
     }
 
-    fn get_is_unassigned(result: &AssignmentResult) -> &BooleanArray {
-        result.batch.column_by_name("is_unassigned").unwrap()
+    fn is_unassigned(r: &crate::data::AssignmentResult) -> &BooleanArray {
+        r.batch.column_by_name("is_unassigned").unwrap()
             .as_any().downcast_ref::<BooleanArray>().unwrap()
     }
 
@@ -313,18 +300,18 @@ mod tests {
 
     #[test]
     fn assigns_high_signal_cells() {
-        // 6 cells × 1 guide. C1 and C3 have zero counts (implicit in sparse matrix).
-        // C2 has a single UMI — noise level. C4/C5/C6 have 25/30/22 — clear signal.
-        // The model should find a threshold that separates noise from signal.
+        // 6 cells × 1 guide. Cells 0/2 have zero counts (absent from sparse matrix).
+        // Cell 1 has 1 UMI — noise level. Cells 3/4/5 have 25/30/22 — clear signal.
+        // On log10 scale: 0.0 vs ~1.4. GMM should separate them.
         let input = make_input(
             6, 1,
             vec![(1, 0, 1), (3, 0, 25), (4, 0, 30), (5, 0, 22)],
             &["C1", "C2", "C3", "C4", "C5", "C6"],
             &["gA"],
         );
-        let model = PoissonGaussModel { min_confidence: 0.5, ..Default::default() };
+        let model = GaussModel { min_confidence: 0.5, ..Default::default() };
         let result = model.assign(&input).unwrap();
-        let is_u = get_is_unassigned(&result);
+        let is_u = is_unassigned(&result);
 
         assert!(is_u.value(0), "C1 (0 counts) should be unassigned");
         assert!(is_u.value(1), "C2 (1 count) should be unassigned");
@@ -336,16 +323,16 @@ mod tests {
 
     #[test]
     fn skips_guides_with_too_little_signal() {
-        // max_count = 1, which is below min_max_count = 2. fit_guide returns None,
-        // so no cell can ever pass the threshold — all three cells must be unassigned.
+        // max_count = 1 < min_max_count = 2 → fit_guide returns None.
+        // No cell can pass a threshold that doesn't exist.
         let input = make_input(
             3, 1,
             vec![(1, 0, 1), (2, 0, 1)],
             &["C1", "C2", "C3"],
             &["gA"],
         );
-        let result = PoissonGaussModel::default().assign(&input).unwrap();
-        let is_u = get_is_unassigned(&result);
+        let result = GaussModel::default().assign(&input).unwrap();
+        let is_u = is_unassigned(&result);
         assert!(is_u.value(0));
         assert!(is_u.value(1));
         assert!(is_u.value(2));
@@ -353,25 +340,23 @@ mod tests {
 
     #[test]
     fn guide_name_in_output_correct() {
-        // guide_id is stored as a Dictionary<Int16, Utf8>. Verify the dictionary
-        // encoding resolves to the correct guide name for each assigned cell.
+        // Dictionary-encoded guide_id must resolve to the correct guide name.
         let input = make_input(
             4, 1,
             vec![(1, 0, 1), (2, 0, 25), (3, 0, 30)],
             &["C1", "C2", "C3", "C4"],
             &["sgTP53_1"],
         );
-        let model = PoissonGaussModel { min_confidence: 0.5, ..Default::default() };
+        let model = GaussModel { min_confidence: 0.5, ..Default::default() };
         let result = model.assign(&input).unwrap();
-        let is_u = get_is_unassigned(&result);
-
+        let is_u = is_unassigned(&result);
         let assigned_cells: Vec<usize> = (0..4).filter(|&i| !is_u.value(i)).collect();
-        assert!(!assigned_cells.is_empty(), "at least one cell should be assigned");
+        assert!(!assigned_cells.is_empty());
 
         use arrow::array::DictionaryArray;
         use arrow::datatypes::Int16Type;
-        let guide_col = result.batch.column_by_name("guide_id").unwrap();
-        let dict = guide_col.as_any().downcast_ref::<DictionaryArray<Int16Type>>().unwrap();
+        let dict = result.batch.column_by_name("guide_id").unwrap()
+            .as_any().downcast_ref::<DictionaryArray<Int16Type>>().unwrap();
         let values = dict.values().as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
         for &i in &assigned_cells {
             let key = dict.keys().value(i) as usize;
@@ -381,69 +366,62 @@ mod tests {
 
     #[test]
     fn multi_infected_flagged() {
-        // C1 has noise counts for both guides (1 UMI each) — not infected.
-        // C2 has signal-level counts for both gA (25) and gB (28) — multi-infected.
-        // C3/C4 are singly infected via gA; C5 via gB.
-        // is_multi_infected should be true only for C2.
+        // C4 (index 3) has signal-level counts for both gA (25) and gB (28) → multi-infected.
+        // Both guides need enough noise + signal observations for the GMM to converge cleanly.
         let input = make_input(
-            5, 2,
+            8, 2,
             vec![
                 (0, 0, 1), (0, 1, 1),
-                (1, 0, 25), (1, 1, 28),  // C2: both guides at signal level
-                (2, 0, 26),
-                (3, 0, 24),
-                (4, 1, 29),
+                (1, 0, 1), (1, 1, 1),
+                (2, 0, 1),
+                (3, 0, 25), (3, 1, 28),
+                (4, 0, 26),
+                (5, 0, 24),
+                (6, 1, 29),
+                (7, 1, 30),
             ],
-            &["C1", "C2", "C3", "C4", "C5"],
+            &["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"],
             &["gA", "gB"],
         );
-        let model = PoissonGaussModel { min_confidence: 0.5, ..Default::default() };
+        let model = GaussModel { min_confidence: 0.5, ..Default::default() };
         let result = model.assign(&input).unwrap();
-
         let is_multi = result.batch.column_by_name("is_multi_infected").unwrap()
             .as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(is_multi.value(1), "C2 should be multi-infected");
-        assert!(!is_multi.value(0), "C1 has only noise counts, not multi-infected");
+        assert!(is_multi.value(3), "C4 should be multi-infected");
+        assert!(!is_multi.value(0), "C1 is noise only, not multi-infected");
     }
 
     #[test]
     fn n_guides_detected_matches_n_passing() {
         // gA: signal in C3 (25) and C4 (26). gB: signal in C3 (28) and C5 (30).
-        // Each guide has ≥ 2 nonzeros so fit_guide proceeds (min_nonzero = 2).
-        // C3 passes threshold for both guides → n_guides_detected = 2.
-        // C4 passes only gA → n_guides_detected = 1.
+        // C3 passes both → n_guides_detected = 2. C4 passes only gA → 1.
         let input = make_input(
             5, 2,
             vec![(1, 0, 1), (2, 0, 25), (2, 1, 28), (3, 0, 26), (4, 1, 30)],
             &["C1", "C2", "C3", "C4", "C5"],
             &["gA", "gB"],
         );
-        let model = PoissonGaussModel { min_confidence: 0.5, ..Default::default() };
+        let model = GaussModel { min_confidence: 0.5, ..Default::default() };
         let result = model.assign(&input).unwrap();
-
         use arrow::array::UInt8Array;
         let n_det = result.batch.column_by_name("n_guides_detected").unwrap()
             .as_any().downcast_ref::<UInt8Array>().unwrap();
-
         assert_eq!(n_det.value(2), 2, "C3 detected 2 guides");
         assert_eq!(n_det.value(3), 1, "C4 detected 1 guide");
     }
 
     #[test]
     fn assigned_x_matches_batch() {
-        // The sparse assignment matrix assigned_x must mirror is_unassigned:
-        // assigned cells have exactly one nonzero (value = 1) in their row;
-        // unassigned cells have an empty row.
+        // Assigned cells must have exactly one nonzero in assigned_x; unassigned cells none.
         let input = make_input(
             4, 1,
             vec![(1, 0, 1), (2, 0, 25), (3, 0, 30)],
             &["C1", "C2", "C3", "C4"],
             &["gA"],
         );
-        let model = PoissonGaussModel { min_confidence: 0.5, ..Default::default() };
+        let model = GaussModel { min_confidence: 0.5, ..Default::default() };
         let result = model.assign(&input).unwrap();
-        let is_u = get_is_unassigned(&result);
-
+        let is_u = is_unassigned(&result);
         for cell in 0..4 {
             let row = result.assigned_x.get_row(cell).unwrap();
             if !is_u.value(cell) {
@@ -457,17 +435,15 @@ mod tests {
 
     #[test]
     fn cell_barcodes_in_output_come_from_input() {
-        // Barcodes are passed through from LoadedInput unchanged — the model never
-        // reorders or drops cells, so output row i always corresponds to input cell i.
+        // Output row i always corresponds to input cell i; barcodes are never reordered.
         let input = make_input(
             3, 1,
             vec![(1, 0, 25), (2, 0, 30)],
             &["BARCODE_A", "BARCODE_B", "BARCODE_C"],
             &["gX"],
         );
-        let model = PoissonGaussModel { min_confidence: 0.5, ..Default::default() };
+        let model = GaussModel { min_confidence: 0.5, ..Default::default() };
         let result = model.assign(&input).unwrap();
-
         let bc = result.batch.column_by_name("cell_barcode").unwrap()
             .as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
         assert_eq!(bc.value(0), "BARCODE_A");
@@ -477,18 +453,15 @@ mod tests {
 
     #[test]
     fn empty_input_produces_empty_result() {
-        // Zero cells and zero guides: valid edge case, must not panic.
         let input = make_input(0, 0, vec![], &[], &[]);
-        let result = PoissonGaussModel::default().assign(&input).unwrap();
+        let result = GaussModel::default().assign(&input).unwrap();
         assert_eq!(result.batch.num_rows(), 0);
         assert_eq!(result.assigned_x.nnz(), 0);
     }
 
     #[test]
     fn unassigned_columns_are_null() {
-        // When a cell is unassigned, guide_id / umi_count / assignment_confidence
-        // must be Arrow null — not zero or empty string — to satisfy the schema contract.
-        // Here all counts are noise (max = 1 < min_max_count = 2), so no cell is assigned.
+        // All counts = 1 → max = 1 < min_max_count = 2; no cell assigned.
         use arrow::array::Array;
         let input = make_input(
             3, 1,
@@ -496,10 +469,8 @@ mod tests {
             &["C1", "C2", "C3"],
             &["gA"],
         );
-        let result = PoissonGaussModel::default().assign(&input).unwrap();
+        let result = GaussModel::default().assign(&input).unwrap();
         for i in 0..3 {
-            assert!(result.batch.column_by_name("is_unassigned").unwrap()
-                .as_any().downcast_ref::<BooleanArray>().unwrap().value(i));
             assert!(result.batch.column_by_name("guide_id").unwrap().is_null(i));
             assert!(result.batch.column_by_name("umi_count").unwrap().is_null(i));
             assert!(result.batch.column_by_name("assignment_confidence").unwrap().is_null(i));
@@ -512,59 +483,55 @@ mod tests {
 
     #[test]
     fn fit_mixture_separates_bimodal_data() {
-        // Synthetic counts with a clear two-component structure:
-        // background cluster at 1–3 UMIs, signal cluster at 20–30 UMIs.
-        // After convergence, mu_signal must exceed lambda_bg.
-        let nonzero: Vec<f64> = (0..20)
-            .map(|i| if i < 15 { 1.0 + i as f64 * 0.1 } else { 20.0 + (i - 15) as f64 * 2.0 })
-            .collect();
-        let params = fit_mixture(&nonzero, 100, 100, 1e-8);
+        // Background cluster near log10(2) ≈ 0.30; signal cluster near log10(26) ≈ 1.41.
+        // After convergence, mu_signal must exceed mu_bg.
+        let bg: Vec<f64> = (0..15).map(|_| 0.301).collect(); // log10(2)
+        let sig: Vec<f64> = vec![1.408, 1.431, 1.415, 1.447, 1.380]; // log10(25..30)
+        let all: Vec<f64> = bg.into_iter().chain(sig).collect();
+        let params = fit_mixture(&all, 100, 100, 1e-8);
         assert!(
-            params.mu_signal > params.lambda_bg,
-            "mu_signal ({}) should exceed lambda_bg ({})",
-            params.mu_signal, params.lambda_bg
+            params.mu_signal > params.mu_bg,
+            "mu_signal ({}) should exceed mu_bg ({})",
+            params.mu_signal, params.mu_bg
         );
     }
 
     #[test]
     fn posterior_signal_high_for_large_count() {
         // Fit on a clearly bimodal set, then evaluate posteriors at known-background
-        // and known-signal counts. The mixture should assign > 0.9 to signal at 25 UMIs
-        // and < 0.1 to signal at 1 UMI.
-        let nonzero: Vec<f64> = vec![1.0, 1.5, 2.0, 20.0, 22.0, 25.0, 28.0];
+        // and known-signal log10 values. Signal posterior must be high at count 25,
+        // low at count 1.
+        let nonzero: Vec<f64> = vec![0.301, 0.322, 0.342, 1.408, 1.431, 1.447, 1.462];
         let params = fit_mixture(&nonzero, 50, 100, 1e-8);
-        let p_high = posterior_signal(25.0, params);
-        let p_low = posterior_signal(1.0, params);
+        let p_high = posterior_signal((25.0_f64 + 1.0).log10(), params);
+        let p_low = posterior_signal((1.0_f64 + 1.0).log10(), params);
         assert!(p_high > 0.9, "posterior at signal level should be > 0.9, got {p_high}");
         assert!(p_low < 0.1, "posterior at background level should be < 0.1, got {p_low}");
     }
 
     #[test]
     fn fit_guide_returns_none_for_tiny_data() {
-        // Only 1 nonzero value → below min_nonzero = 2. Cannot fit a mixture reliably.
-        let model = PoissonGaussModel::default();
+        // Only 1 nonzero value → below min_nonzero = 2.
+        let model = GaussModel::default();
         assert_eq!(model.fit_guide(&[0, 5, 0], 10), None);
     }
 
     #[test]
     fn fit_guide_returns_none_for_low_max() {
-        // max_count = 1 < min_max_count = 2. Even if there are enough nonzeros,
-        // we can't distinguish signal from background at this count level.
-        let model = PoissonGaussModel::default();
+        // max_count = 1 < min_max_count = 2.
+        let model = GaussModel::default();
         assert_eq!(model.fit_guide(&[0, 1, 1, 1], 10), None);
     }
 
     #[test]
     fn zeros_included_in_background_estimate() {
-        // Zeros are Poisson background observations. The more zeros, the lower the
-        // MLE for lambda_bg. A guide with 1000 zero-count cells should yield a much
-        // smaller lambda_bg than the same nonzero counts with only 5 zero cells.
-        let nonzero: Vec<f64> = vec![1.0, 2.0, 25.0, 28.0, 30.0];
-        let params_few_zeros = fit_mixture(&nonzero, 5, 100, 1e-8);
-        let params_many_zeros = fit_mixture(&nonzero, 1000, 100, 1e-8);
+        // More zeros should pull mu_bg toward 0 (log10(1) = 0.0) and lower sigma.
+        let nonzero: Vec<f64> = vec![0.301, 0.322, 1.408, 1.431, 1.447];
+        let params_few = fit_mixture(&nonzero, 5, 100, 1e-8);
+        let params_many = fit_mixture(&nonzero, 1000, 100, 1e-8);
         assert!(
-            params_many_zeros.lambda_bg < params_few_zeros.lambda_bg,
-            "more zeros should pull lambda_bg down"
+            params_many.mu_bg <= params_few.mu_bg + 0.05,
+            "more zeros should pull mu_bg toward 0"
         );
     }
 }

@@ -2,6 +2,8 @@ use crate::data::{AssignmentResult, LoadedInput};
 use anyhow::Result;
 use serde_json::Value;
 
+pub mod em;
+pub mod gauss;
 pub mod max;
 pub mod output;
 pub mod poisson_gauss;
