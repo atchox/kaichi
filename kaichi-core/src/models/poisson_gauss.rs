@@ -1,12 +1,11 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_normal_pdf, logsumexp2, run_em};
+use super::em::{clamp_probability, log_normal_pdf, log_poisson_pmf, logsumexp2, run_em};
 use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
 
 use anyhow::Result;
 use rayon::prelude::*;
 use serde_json::{json, Value};
-use statrs::function::gamma::ln_gamma;
 
 /// Per-guide Poisson-Gaussian mixture model on raw UMI counts.
 ///
@@ -241,9 +240,6 @@ fn posterior_signal(x: f64, params: FitParams) -> f64 {
     (log_sig - denom).exp()
 }
 
-fn log_poisson_pmf(x: f64, lambda: f64) -> f64 {
-    x * lambda.ln() - lambda - ln_gamma(x + 1.0)
-}
 
 // ---------------------------------------------------------------------------
 // Tests

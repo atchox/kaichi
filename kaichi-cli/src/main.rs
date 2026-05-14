@@ -75,6 +75,12 @@ fn run_model(
         "max"           => kaichi_core::models::max::MaxModel::default().assign(input),
         "ratio"         => kaichi_core::models::ratio::RatioModel::default().assign(input),
         "poisson_gauss" => kaichi_core::models::poisson_gauss::PoissonGaussModel::default().assign(input),
+        "poisson"       => kaichi_core::models::poisson::PoissonModel::default().assign(input),
+        "neg_binomial"  => kaichi_core::models::neg_binomial::NegBinomialModel::default().assign(input),
+        "binomial"      => kaichi_core::models::binomial::BinomialModel::default().assign(input),
+        "beta2"         => kaichi_core::models::beta::Beta2Model::default().assign(input),
+        "beta3"         => kaichi_core::models::beta::Beta3Model::default().assign(input),
+        "quantiles"     => kaichi_core::models::quantiles::QuantilesModel::default().assign(input),
         other           => bail!("unknown model: {other}"),
     }
 }
@@ -86,6 +92,12 @@ fn run_model_params(name: &str, _input: &kaichi_core::data::LoadedInput) -> Resu
         "max"           => kaichi_core::models::max::MaxModel::default().params_json(),
         "ratio"         => kaichi_core::models::ratio::RatioModel::default().params_json(),
         "poisson_gauss" => kaichi_core::models::poisson_gauss::PoissonGaussModel::default().params_json(),
+        "poisson"       => kaichi_core::models::poisson::PoissonModel::default().params_json(),
+        "neg_binomial"  => kaichi_core::models::neg_binomial::NegBinomialModel::default().params_json(),
+        "binomial"      => kaichi_core::models::binomial::BinomialModel::default().params_json(),
+        "beta2"         => kaichi_core::models::beta::Beta2Model::default().params_json(),
+        "beta3"         => kaichi_core::models::beta::Beta3Model::default().params_json(),
+        "quantiles"     => kaichi_core::models::quantiles::QuantilesModel::default().params_json(),
         other           => bail!("unknown model: {other}"),
     };
     Ok(v.to_string())

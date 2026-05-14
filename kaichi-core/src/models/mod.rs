@@ -2,11 +2,16 @@ use crate::data::{AssignmentResult, LoadedInput};
 use anyhow::Result;
 use serde_json::Value;
 
+pub mod beta;
+pub mod binomial;
 pub mod em;
 pub mod gauss;
 pub mod max;
+pub mod neg_binomial;
 pub mod output;
+pub mod poisson;
 pub mod poisson_gauss;
+pub mod quantiles;
 pub mod ratio;
 pub mod umi;
 
