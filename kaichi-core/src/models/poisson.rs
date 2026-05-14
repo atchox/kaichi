@@ -170,14 +170,12 @@ fn fit_mixture(data: &[(f64, f64)], max_em_iters: u32, inner_max_iters: u32, tol
 }
 
 fn initialize_params(data: &[(f64, f64)]) -> FitParams {
-    let n = data.len() as f64;
-    let mean_y: f64 = data.iter().map(|(y, _)| y).sum::<f64>() / n;
     let max_y: f64 = data.iter().map(|(y, _)| *y).fold(f64::NEG_INFINITY, f64::max);
-    let mean_depth: f64 = data.iter().map(|(_, d)| d.exp()).sum::<f64>() / n;
-    let beta0 = (mean_y / mean_depth.max(1e-6)).ln().clamp(-10.0, 10.0);
+    let mean_depth: f64 = data.iter().map(|(_, d)| d.exp()).sum::<f64>() / data.len() as f64;
     let mut sorted_y: Vec<f64> = data.iter().map(|(y, _)| *y).collect();
     sorted_y.sort_by(f64::total_cmp);
     let median_y = sorted_y[sorted_y.len() / 2].max(1.0);
+    let beta0 = (median_y / mean_depth.max(1e-6)).ln().clamp(-10.0, 10.0);
     let beta1 = (max_y / median_y).ln().max(0.1);
     FitParams { pi: 0.1, beta0, beta1 }
 }

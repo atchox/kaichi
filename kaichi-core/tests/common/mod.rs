@@ -31,8 +31,13 @@ pub fn reference_assignments(model: &str) -> PathBuf {
         "umi"           => ("UMI",               "assignments_t5.csv"),
         "max"           => ("maximum",            "assignments.csv"),
         "ratio"         => ("ratios",             "assignments_t0.3.csv"),
-        "neg_binomial"  => ("negative_binomial",  "assignments.csv"),
         "poisson_gauss" => ("poisson_gauss",      "assignments.csv"),
+        "poisson"       => ("poisson",            "assignments.csv"),
+        "neg_binomial"  => ("negative_binomial",  "assignments.csv"),
+        "binomial"      => ("binomial",           "assignments.csv"),
+        "beta2"         => ("2-BetaMM",           "assignments.csv"),
+        "beta3"         => ("3-BetaMM",           "assignments.csv"),
+        "quantiles"     => ("quantiles",          "assignments_t0.1.csv"),
         other => panic!("no reference fixture registered for model '{}'", other),
     };
     crispat_dir()
