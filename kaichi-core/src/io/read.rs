@@ -240,7 +240,6 @@ pub mod testutil {
 mod tests {
     use super::testutil::write_test_h5ad;
     use super::read_h5ad;
-    use arrow::array::StringArray;
     use tempfile::NamedTempFile;
 
     fn tmp_h5ad() -> NamedTempFile {

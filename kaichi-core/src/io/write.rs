@@ -259,7 +259,6 @@ fn write_scalar_str_dataset(grp: &Group, name: &str, val: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::data::{CountMatrix, Covariates, GuideMetadata};
-    use crate::io::read::testutil::write_test_h5ad;
     use crate::io::read::read_h5ad;
     use arrow::array::{Float32Array, StringBuilder};
     use std::sync::Arc;

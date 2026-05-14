@@ -219,9 +219,12 @@ Recommended development sequence for this model specifically:
 (no dispersion parameter `θ`). Faster, but underfits overdispersed counts.
 Closed-form weighted Poisson MLE is available — even faster M-step than NB.
 
-`poisson_gauss`: per-guide mixture where background ~ Poisson and signal ~
-Gaussian on log-counts. The Gaussian component has closed-form M-step; Poisson
-does too. Should be the fastest of the hierarchical models.
+`poisson_gauss`: per-guide mixture where background ~ Poisson(λ) and signal ~
+N(μ, σ²), both on **raw UMI counts**. Zeros are included analytically in the EM
+updates as Poisson background observations — no log transform, no zero exclusion.
+Both components have closed-form M-steps (Poisson MLE = weighted mean of counts;
+Gaussian MLE = weighted mean and variance). This is the same statistical model as
+crispat's pgmm; the difference is EM (kaichi) vs SVI (crispat).
 
 Implemented parameters:
 
