@@ -1,19 +1,9 @@
 use super::AssignmentModel;
+use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
-use crate::schema::assignment_schema_ref;
 
-use anyhow::{Context, Result};
-use arrow::{
-    array::{
-        BooleanBuilder, DictionaryArray, Float32Builder, StringArray,
-        StringDictionaryBuilder, UInt32Builder, UInt8Builder,
-    },
-    datatypes::Int16Type,
-    record_batch::RecordBatch,
-};
-use nalgebra_sparse::CsrMatrix;
+use anyhow::Result;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 /// Assign each cell to the guide with the highest UMI count.
 ///
@@ -42,86 +32,38 @@ impl AssignmentModel for MaxModel {
         let guide_ids = &input.guide_metadata.guide_ids;
         let cell_barcodes = &input.covariates.cell_barcodes;
 
-        let mut out_guide_ids: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
-        let mut out_target_genes: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
-        let mut out_umi_counts = UInt32Builder::with_capacity(n_cells);
-        let mut out_confidence = Float32Builder::with_capacity(n_cells);
-        let mut out_is_unassigned = BooleanBuilder::with_capacity(n_cells);
-        let mut out_is_multi = BooleanBuilder::with_capacity(n_cells);
-        let mut out_n_detected = UInt8Builder::with_capacity(n_cells);
-
-        let mut assigned_triples: Vec<(usize, usize)> = Vec::new();
+        let mut out = AssignmentOutputBuilder::new(n_cells, n_guides, self.name());
 
         for cell in 0..n_cells {
             let row = csr.get_row(cell).unwrap();
-
             let max_count = row.values().iter().copied().max().unwrap_or(0);
 
             if max_count == 0 || max_count < self.umi_threshold {
-                out_guide_ids.append_null();
-                out_target_genes.append_null();
-                out_umi_counts.append_null();
-                out_confidence.append_null();
-                out_is_unassigned.append_value(true);
-                out_is_multi.append_value(false);
-                out_n_detected.append_value(0);
+                out.append_unassigned(0);
                 continue;
             }
 
-            let top: Vec<usize> = row.col_indices().iter().zip(row.values())
-                .filter(|(_, &v)| v == max_count)
-                .map(|(&g, _)| g)
-                .collect();
+            // Collect all guide indices tied for max — at most n_guides, typically 1.
+            let mut top_idx: usize = 0;
+            let mut n_tied: usize = 0;
+            for (&g, &v) in row.col_indices().iter().zip(row.values()) {
+                if v == max_count {
+                    top_idx = g;
+                    n_tied += 1;
+                }
+            }
 
-            out_n_detected.append_value(top.len().min(255) as u8);
-
-            if top.len() > 1 {
-                // Tie → unassigned.
-                out_guide_ids.append_null();
-                out_target_genes.append_null();
-                out_umi_counts.append_null();
-                out_confidence.append_null();
-                out_is_unassigned.append_value(true);
-                out_is_multi.append_value(false);
+            let n_det = n_detected_u8(n_tied);
+            if n_tied > 1 {
+                out.append_unassigned(n_det);
             } else {
-                let g = top[0];
-                out_guide_ids.append_value(guide_ids.value(g));
-                out_target_genes.append_null();
-                out_umi_counts.append_value(max_count);
-                out_confidence.append_value(1.0);
-                out_is_unassigned.append_value(false);
-                out_is_multi.append_value(false);
-                assigned_triples.push((cell, g));
+                out.append_assigned(guide_ids.value(top_idx), max_count, 1.0, false, n_det);
+                out.push_assigned_triple(cell, top_idx);
             }
         }
 
-        let model_name_arr: DictionaryArray<arrow::datatypes::Int8Type> = {
-            let values = StringArray::from(vec![self.name()]);
-            let keys = arrow::array::Int8Array::from(vec![0i8; n_cells]);
-            DictionaryArray::try_new(keys, Arc::new(values))
-                .context("failed to build assignment_model dictionary")?
-        };
-
-        let batch = RecordBatch::try_new(
-            assignment_schema_ref(),
-            vec![
-                Arc::new(cell_barcodes.clone()),
-                Arc::new(out_guide_ids.finish()),
-                Arc::new(out_target_genes.finish()),
-                Arc::new(out_umi_counts.finish()),
-                Arc::new(out_confidence.finish()),
-                Arc::new(model_name_arr),
-                Arc::new(out_is_unassigned.finish()),
-                Arc::new(out_is_multi.finish()),
-                Arc::new(out_n_detected.finish()),
-            ],
-        )
-        .context("failed to build output RecordBatch")?;
-
-        assigned_triples.sort_unstable();
-        let assigned_x = build_assigned_csr(assigned_triples, n_cells, n_guides);
-
-        Ok(AssignmentResult { batch, assigned_x })
+        // Triples emitted in cell-major order with one entry per cell — already sorted.
+        out.finish(cell_barcodes, true)
     }
 
     fn params_json(&self) -> Value {
@@ -129,25 +71,11 @@ impl AssignmentModel for MaxModel {
     }
 }
 
-fn build_assigned_csr(triples: Vec<(usize, usize)>, n_cells: usize, n_guides: usize) -> CsrMatrix<u8> {
-    let nnz = triples.len();
-    let mut row_offsets = vec![0usize; n_cells + 1];
-    let mut col_indices = Vec::with_capacity(nnz);
-    let mut last = 0usize;
-    for (idx, &(r, c)) in triples.iter().enumerate() {
-        while last < r { row_offsets[last + 1] = idx; last += 1; }
-        col_indices.push(c);
-    }
-    for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-    CsrMatrix::try_from_csr_data(n_cells, n_guides, row_offsets, col_indices, vec![1u8; nnz])
-        .expect("assigned CSR from sorted unique triples cannot fail")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::{CountMatrix, Covariates, GuideMetadata};
-    use arrow::array::{BooleanArray, Float32Array, StringBuilder, UInt32Array};
+    use arrow::array::{BooleanArray, Float32Array, StringArray, StringBuilder, UInt32Array};
 
     fn make_input(n_cells: usize, n_guides: usize, triples: Vec<(usize, usize, u32)>) -> LoadedInput {
         let mut sorted = triples;

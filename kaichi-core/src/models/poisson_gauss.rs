@@ -1,21 +1,12 @@
 use super::AssignmentModel;
+use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
-use crate::schema::assignment_schema_ref;
 
-use anyhow::{Context, Result};
-use arrow::{
-    array::{
-        BooleanBuilder, DictionaryArray, Float32Builder, StringArray,
-        StringDictionaryBuilder, UInt32Builder, UInt8Builder,
-    },
-    datatypes::Int16Type,
-    record_batch::RecordBatch,
-};
-use nalgebra_sparse::CsrMatrix;
+use anyhow::Result;
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use statrs::function::gamma::ln_gamma;
-use std::{f64::consts::PI, sync::Arc};
+use std::f64::consts::PI;
 
 /// Per-guide Poisson-Gaussian mixture model on raw UMI counts.
 ///
@@ -62,6 +53,7 @@ impl AssignmentModel for PoissonGaussModel {
         let n_guides = input.counts.n_guides;
         let csc = input.counts.csc();
 
+        // Step 1: per-guide EM in parallel via CSC columns.
         let guide_fits: Vec<Option<(u32, FitParams)>> = (0..n_guides)
             .into_par_iter()
             .map(|g| {
@@ -71,24 +63,16 @@ impl AssignmentModel for PoissonGaussModel {
             })
             .collect();
 
+        // Step 2: iterate cells in CSR row order, applying stored FitParams.
         let csr = input.counts.csr();
         let guide_ids_arr = &input.guide_metadata.guide_ids;
         let cell_barcodes = &input.covariates.cell_barcodes;
 
-        let mut out_guide_ids: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
-        let mut out_target_genes: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
-        let mut out_umi_counts = UInt32Builder::with_capacity(n_cells);
-        let mut out_confidence = Float32Builder::with_capacity(n_cells);
-        let mut out_is_unassigned = BooleanBuilder::with_capacity(n_cells);
-        let mut out_is_multi = BooleanBuilder::with_capacity(n_cells);
-        let mut out_n_detected = UInt8Builder::with_capacity(n_cells);
-
-        let mut assigned_triples: Vec<(usize, usize)> = Vec::new();
+        let mut out = AssignmentOutputBuilder::new(n_cells, n_guides, self.name());
 
         for cell in 0..n_cells {
             let row = csr.get_row(cell).unwrap();
-
-            let mut best_guide: Option<(&str, f32, u32)> = None;
+            let mut best: Option<(usize, f32, u32)> = None;
             let mut n_passing: usize = 0;
 
             for (&guide_idx, &count) in row.col_indices().iter().zip(row.values().iter()) {
@@ -98,69 +82,36 @@ impl AssignmentModel for PoissonGaussModel {
                 let posterior = posterior_signal(count as f64, params) as f32;
                 if posterior >= self.min_confidence {
                     n_passing += 1;
-                    let guide_name = guide_ids_arr.value(guide_idx);
-                    match best_guide {
-                        None => best_guide = Some((guide_name, posterior, count)),
+                    match best {
+                        None => best = Some((guide_idx, posterior, count)),
                         Some((_, best_post, best_count)) => {
                             if posterior > best_post || (posterior == best_post && count > best_count) {
-                                best_guide = Some((guide_name, posterior, count));
+                                best = Some((guide_idx, posterior, count));
                             }
                         }
                     }
-                    assigned_triples.push((cell, guide_idx));
+                    out.push_assigned_triple(cell, guide_idx);
                 }
             }
 
-            out_n_detected.append_value(n_passing.min(255) as u8);
-
-            match best_guide {
-                None => {
-                    out_guide_ids.append_null();
-                    out_target_genes.append_null();
-                    out_umi_counts.append_null();
-                    out_confidence.append_null();
-                    out_is_unassigned.append_value(true);
-                    out_is_multi.append_value(false);
-                }
-                Some((guide, posterior, count)) => {
-                    out_guide_ids.append_value(guide);
-                    out_target_genes.append_null();
-                    out_umi_counts.append_value(count);
-                    out_confidence.append_value(posterior);
-                    out_is_unassigned.append_value(false);
-                    out_is_multi.append_value(n_passing > 1);
+            let n_det = n_detected_u8(n_passing);
+            match best {
+                None => out.append_unassigned(n_det),
+                Some((guide_idx, posterior, count)) => {
+                    out.append_assigned(
+                        guide_ids_arr.value(guide_idx),
+                        count,
+                        posterior,
+                        n_passing > 1,
+                        n_det,
+                    );
                 }
             }
         }
 
-        let model_name_arr: DictionaryArray<arrow::datatypes::Int8Type> = {
-            let values = StringArray::from(vec![self.name()]);
-            let keys = arrow::array::Int8Array::from(vec![0i8; n_cells]);
-            DictionaryArray::try_new(keys, Arc::new(values))
-                .context("failed to build assignment_model dictionary")?
-        };
-
-        let batch = RecordBatch::try_new(
-            assignment_schema_ref(),
-            vec![
-                Arc::new(cell_barcodes.clone()),
-                Arc::new(out_guide_ids.finish()),
-                Arc::new(out_target_genes.finish()),
-                Arc::new(out_umi_counts.finish()),
-                Arc::new(out_confidence.finish()),
-                Arc::new(model_name_arr),
-                Arc::new(out_is_unassigned.finish()),
-                Arc::new(out_is_multi.finish()),
-                Arc::new(out_n_detected.finish()),
-            ],
-        )
-        .context("failed to build output RecordBatch")?;
-
-        assigned_triples.sort_unstable();
-        assigned_triples.dedup();
-        let assigned_x = build_assigned_csr(assigned_triples, n_cells, n_guides);
-
-        Ok(AssignmentResult { batch, assigned_x })
+        // Every passing guide was pushed in CSR row order (guide-index sorted),
+        // exactly once per (cell, guide). Triples are already strictly sorted.
+        out.finish(cell_barcodes, true)
     }
 
     fn params_json(&self) -> Value {
@@ -201,32 +152,6 @@ impl PoissonGaussModel {
 
         Some((threshold, params))
     }
-}
-
-fn build_assigned_csr(
-    sorted_triples: Vec<(usize, usize)>,
-    n_cells: usize,
-    n_guides: usize,
-) -> CsrMatrix<u8> {
-    let nnz = sorted_triples.len();
-    let mut row_offsets = vec![0usize; n_cells + 1];
-    let mut col_indices = Vec::with_capacity(nnz);
-    let values = vec![1u8; nnz];
-
-    let mut last_row = 0usize;
-    for (idx, &(r, c)) in sorted_triples.iter().enumerate() {
-        while last_row < r {
-            row_offsets[last_row + 1] = idx;
-            last_row += 1;
-        }
-        col_indices.push(c);
-    }
-    for i in (last_row + 1)..=n_cells {
-        row_offsets[i] = nnz;
-    }
-
-    CsrMatrix::try_from_csr_data(n_cells, n_guides, row_offsets, col_indices, values)
-        .expect("assigned CSR construction cannot fail: triples are sorted and deduplicated")
 }
 
 // ---------------------------------------------------------------------------

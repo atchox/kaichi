@@ -1,19 +1,9 @@
 use super::AssignmentModel;
+use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
-use crate::schema::assignment_schema_ref;
 
-use anyhow::{Context, Result};
-use arrow::{
-    array::{
-        BooleanBuilder, DictionaryArray, Float32Builder, StringArray,
-        StringDictionaryBuilder, UInt32Builder, UInt8Builder,
-    },
-    datatypes::Int16Type,
-    record_batch::RecordBatch,
-};
-use nalgebra_sparse::CsrMatrix;
+use anyhow::Result;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 /// Assign each cell-guide pair as positive if UMI count >= umi_threshold.
 ///
@@ -42,109 +32,54 @@ impl AssignmentModel for UmiModel {
         let guide_ids = &input.guide_metadata.guide_ids;
         let cell_barcodes = &input.covariates.cell_barcodes;
 
-        let mut out_guide_ids: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
-        let mut out_target_genes: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
-        let mut out_umi_counts = UInt32Builder::with_capacity(n_cells);
-        let mut out_confidence = Float32Builder::with_capacity(n_cells);
-        let mut out_is_unassigned = BooleanBuilder::with_capacity(n_cells);
-        let mut out_is_multi = BooleanBuilder::with_capacity(n_cells);
-        let mut out_n_detected = UInt8Builder::with_capacity(n_cells);
-
-        let mut assigned_triples: Vec<(usize, usize)> = Vec::new();
+        let mut out = AssignmentOutputBuilder::new(n_cells, n_guides, self.name());
 
         for cell in 0..n_cells {
             let row = csr.get_row(cell).unwrap();
 
-            // Collect (guide_idx, count) for entries above threshold.
-            let above: Vec<(usize, u32)> = row.col_indices().iter().zip(row.values())
-                .filter(|(_, &v)| v >= self.umi_threshold)
-                .map(|(&g, &v)| (g, v))
-                .collect();
-
-            out_n_detected.append_value(above.len().min(255) as u8);
-
-            match above.len() {
-                0 => {
-                    out_guide_ids.append_null();
-                    out_target_genes.append_null();
-                    out_umi_counts.append_null();
-                    out_confidence.append_null();
-                    out_is_unassigned.append_value(true);
-                    out_is_multi.append_value(false);
-                }
-                1 => {
-                    let (g, count) = above[0];
-                    out_guide_ids.append_value(guide_ids.value(g));
-                    out_target_genes.append_null();
-                    out_umi_counts.append_value(count);
-                    out_confidence.append_value(1.0);
-                    out_is_unassigned.append_value(false);
-                    out_is_multi.append_value(false);
-                    assigned_triples.push((cell, g));
-                }
-                _ => {
-                    // Multi-infected: assign to highest UMI guide.
-                    let (g, count) = above.iter().copied().max_by_key(|&(_, v)| v).unwrap();
-                    out_guide_ids.append_value(guide_ids.value(g));
-                    out_target_genes.append_null();
-                    out_umi_counts.append_value(count);
-                    out_confidence.append_value(1.0);
-                    out_is_unassigned.append_value(false);
-                    out_is_multi.append_value(true);
-                    for &(ag, _) in &above {
-                        assigned_triples.push((cell, ag));
+            // Single pass: find best guide (max count among above-threshold) and count passers.
+            let mut best: Option<(usize, u32)> = None;
+            let mut n_above: usize = 0;
+            for (&g, &v) in row.col_indices().iter().zip(row.values()) {
+                if v >= self.umi_threshold {
+                    n_above += 1;
+                    match best {
+                        None => best = Some((g, v)),
+                        Some((_, bv)) if v > bv => best = Some((g, v)),
+                        _ => {}
                     }
                 }
             }
+
+            let n_det = n_detected_u8(n_above);
+
+            match (n_above, best) {
+                (0, _) => out.append_unassigned(n_det),
+                (1, Some((g, v))) => {
+                    out.append_assigned(guide_ids.value(g), v, 1.0, false, n_det);
+                    out.push_assigned_triple(cell, g);
+                }
+                (_, Some((g, v))) => {
+                    // Multi-infected: best gets the assignment row, every passing guide goes into assigned_x.
+                    out.append_assigned(guide_ids.value(g), v, 1.0, true, n_det);
+                    for (&ag, &av) in row.col_indices().iter().zip(row.values()) {
+                        if av >= self.umi_threshold {
+                            out.push_assigned_triple(cell, ag);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
         }
 
-        let model_name_arr: DictionaryArray<arrow::datatypes::Int8Type> = {
-            let values = StringArray::from(vec![self.name()]);
-            let keys = arrow::array::Int8Array::from(vec![0i8; n_cells]);
-            DictionaryArray::try_new(keys, Arc::new(values))
-                .context("failed to build assignment_model dictionary")?
-        };
-
-        let batch = RecordBatch::try_new(
-            assignment_schema_ref(),
-            vec![
-                Arc::new(cell_barcodes.clone()),
-                Arc::new(out_guide_ids.finish()),
-                Arc::new(out_target_genes.finish()),
-                Arc::new(out_umi_counts.finish()),
-                Arc::new(out_confidence.finish()),
-                Arc::new(model_name_arr),
-                Arc::new(out_is_unassigned.finish()),
-                Arc::new(out_is_multi.finish()),
-                Arc::new(out_n_detected.finish()),
-            ],
-        )
-        .context("failed to build output RecordBatch")?;
-
-        assigned_triples.sort_unstable();
-        assigned_triples.dedup();
-        let assigned_x = build_assigned_csr(assigned_triples, n_cells, n_guides);
-
-        Ok(AssignmentResult { batch, assigned_x })
+        // CSR row iteration is guide-index sorted; with one push per cell (single)
+        // or all-passing in sorted order (multi), triples are strictly sorted.
+        out.finish(cell_barcodes, true)
     }
 
     fn params_json(&self) -> Value {
         json!({ "umi_threshold": self.umi_threshold })
     }
-}
-
-fn build_assigned_csr(triples: Vec<(usize, usize)>, n_cells: usize, n_guides: usize) -> CsrMatrix<u8> {
-    let nnz = triples.len();
-    let mut row_offsets = vec![0usize; n_cells + 1];
-    let mut col_indices = Vec::with_capacity(nnz);
-    let mut last = 0usize;
-    for (idx, &(r, c)) in triples.iter().enumerate() {
-        while last < r { row_offsets[last + 1] = idx; last += 1; }
-        col_indices.push(c);
-    }
-    for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-    CsrMatrix::try_from_csr_data(n_cells, n_guides, row_offsets, col_indices, vec![1u8; nnz])
-        .expect("assigned CSR from sorted unique triples cannot fail")
 }
 
 #[cfg(test)]

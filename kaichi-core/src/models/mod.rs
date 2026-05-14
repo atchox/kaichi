@@ -3,6 +3,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 pub mod max;
+pub mod output;
 pub mod poisson_gauss;
 pub mod ratio;
 pub mod umi;

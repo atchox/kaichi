@@ -1,19 +1,9 @@
 use super::AssignmentModel;
+use super::output::AssignmentOutputBuilder;
 use crate::data::{AssignmentResult, LoadedInput};
-use crate::schema::assignment_schema_ref;
 
-use anyhow::{Context, Result};
-use arrow::{
-    array::{
-        BooleanBuilder, DictionaryArray, Float32Builder, StringArray,
-        StringDictionaryBuilder, UInt32Builder, UInt8Builder,
-    },
-    datatypes::Int16Type,
-    record_batch::RecordBatch,
-};
-use nalgebra_sparse::CsrMatrix;
+use anyhow::Result;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 /// Assign each cell to the guide with the largest fraction of total guide UMIs,
 /// if that fraction exceeds min_fraction.
@@ -44,105 +34,46 @@ impl AssignmentModel for RatioModel {
         let guide_ids = &input.guide_metadata.guide_ids;
         let cell_barcodes = &input.covariates.cell_barcodes;
 
-        let mut out_guide_ids: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
-        let mut out_target_genes: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
-        let mut out_umi_counts = UInt32Builder::with_capacity(n_cells);
-        let mut out_confidence = Float32Builder::with_capacity(n_cells);
-        let mut out_is_unassigned = BooleanBuilder::with_capacity(n_cells);
-        let mut out_is_multi = BooleanBuilder::with_capacity(n_cells);
-        let mut out_n_detected = UInt8Builder::with_capacity(n_cells);
-
-        let mut assigned_triples: Vec<(usize, usize)> = Vec::new();
+        let mut out = AssignmentOutputBuilder::new(n_cells, n_guides, self.name());
 
         for cell in 0..n_cells {
             let row = csr.get_row(cell).unwrap();
 
-            let total: u32 = row.values().iter().sum();
+            // Single pass: sum and argmax in one go.
+            let mut total: u32 = 0;
+            let mut best: Option<(usize, u32)> = None;
+            for (&g, &v) in row.col_indices().iter().zip(row.values()) {
+                total += v;
+                match best {
+                    None => best = Some((g, v)),
+                    Some((_, bv)) if v > bv => best = Some((g, v)),
+                    _ => {}
+                }
+            }
 
             if total == 0 {
-                out_guide_ids.append_null();
-                out_target_genes.append_null();
-                out_umi_counts.append_null();
-                out_confidence.append_null();
-                out_is_unassigned.append_value(true);
-                out_is_multi.append_value(false);
-                out_n_detected.append_value(0);
+                out.append_unassigned(0);
                 continue;
             }
 
-            let (top_g, top_count) = row.col_indices().iter().zip(row.values())
-                .max_by_key(|(_, &v)| v)
-                .map(|(&g, &v)| (g, v))
-                .unwrap();
-
+            let (top_g, top_count) = best.unwrap();
             let fraction = top_count as f32 / total as f32;
 
             if fraction > self.min_fraction {
-                out_n_detected.append_value(1);
-                out_guide_ids.append_value(guide_ids.value(top_g));
-                out_target_genes.append_null();
-                out_umi_counts.append_value(top_count);
-                out_confidence.append_value(fraction);
-                out_is_unassigned.append_value(false);
-                out_is_multi.append_value(false);
-                assigned_triples.push((cell, top_g));
+                out.append_assigned(guide_ids.value(top_g), top_count, fraction, false, 1);
+                out.push_assigned_triple(cell, top_g);
             } else {
-                out_n_detected.append_value(0);
-                out_guide_ids.append_null();
-                out_target_genes.append_null();
-                out_umi_counts.append_null();
-                out_confidence.append_null();
-                out_is_unassigned.append_value(true);
-                out_is_multi.append_value(false);
+                out.append_unassigned(0);
             }
         }
 
-        let model_name_arr: DictionaryArray<arrow::datatypes::Int8Type> = {
-            let values = StringArray::from(vec![self.name()]);
-            let keys = arrow::array::Int8Array::from(vec![0i8; n_cells]);
-            DictionaryArray::try_new(keys, Arc::new(values))
-                .context("failed to build assignment_model dictionary")?
-        };
-
-        let batch = RecordBatch::try_new(
-            assignment_schema_ref(),
-            vec![
-                Arc::new(cell_barcodes.clone()),
-                Arc::new(out_guide_ids.finish()),
-                Arc::new(out_target_genes.finish()),
-                Arc::new(out_umi_counts.finish()),
-                Arc::new(out_confidence.finish()),
-                Arc::new(model_name_arr),
-                Arc::new(out_is_unassigned.finish()),
-                Arc::new(out_is_multi.finish()),
-                Arc::new(out_n_detected.finish()),
-            ],
-        )
-        .context("failed to build output RecordBatch")?;
-
-        assigned_triples.sort_unstable();
-        let assigned_x = build_assigned_csr(assigned_triples, n_cells, n_guides);
-
-        Ok(AssignmentResult { batch, assigned_x })
+        // Triples emitted in cell-major order with at most one entry per cell — sorted.
+        out.finish(cell_barcodes, true)
     }
 
     fn params_json(&self) -> Value {
         json!({ "min_fraction": self.min_fraction })
     }
-}
-
-fn build_assigned_csr(triples: Vec<(usize, usize)>, n_cells: usize, n_guides: usize) -> CsrMatrix<u8> {
-    let nnz = triples.len();
-    let mut row_offsets = vec![0usize; n_cells + 1];
-    let mut col_indices = Vec::with_capacity(nnz);
-    let mut last = 0usize;
-    for (idx, &(r, c)) in triples.iter().enumerate() {
-        while last < r { row_offsets[last + 1] = idx; last += 1; }
-        col_indices.push(c);
-    }
-    for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-    CsrMatrix::try_from_csr_data(n_cells, n_guides, row_offsets, col_indices, vec![1u8; nnz])
-        .expect("assigned CSR from sorted triples cannot fail")
 }
 
 #[cfg(test)]
