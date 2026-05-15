@@ -116,4 +116,175 @@ mod tests {
         let result = run_em(0.5f64, |p| (p, 0.0), 100, 1e-6);
         assert!(result.is_finite());
     }
+
+    // ---- log_beta_pdf ----
+
+    #[test]
+    fn log_beta_pdf_uniform_is_zero() {
+        // Beta(1, 1) is uniform on (0,1), density ≡ 1, log-density ≡ 0.
+        for &x in &[0.1, 0.3, 0.5, 0.7, 0.9] {
+            assert!(log_beta_pdf(x, 1.0, 1.0).abs() < 1e-12, "Beta(1,1) at {x}");
+        }
+    }
+
+    #[test]
+    fn log_beta_pdf_known_value_at_2_2() {
+        // Beta(2, 2): f(x) = 6·x·(1-x); at x=0.5 → 1.5, log = ln(1.5).
+        let got = log_beta_pdf(0.5, 2.0, 2.0);
+        let want = 1.5f64.ln();
+        assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
+    }
+
+    #[test]
+    fn log_beta_pdf_symmetric_under_swap() {
+        // f(x; α, β) = f(1-x; β, α).
+        let cases = [(0.2, 3.0, 5.0), (0.7, 10.0, 2.0), (0.05, 1.5, 8.5)];
+        for (x, a, b) in cases {
+            let lhs = log_beta_pdf(x, a, b);
+            let rhs = log_beta_pdf(1.0 - x, b, a);
+            assert!((lhs - rhs).abs() < 1e-12);
+        }
+    }
+
+    // ---- log_normal_pdf ----
+
+    #[test]
+    fn log_normal_pdf_at_mean_is_log_normalizer() {
+        // φ(μ; μ, σ) = 1/(σ·√(2π)); log = -0.5·ln(2π) - ln σ.
+        let want = -0.5 * (2.0 * PI).ln() - 2.0f64.ln();
+        let got = log_normal_pdf(3.0, 3.0, 2.0);
+        assert!((got - want).abs() < 1e-12);
+    }
+
+    #[test]
+    fn log_normal_pdf_symmetric_about_mean() {
+        let mu = 1.5;
+        for &d in &[0.1, 0.5, 1.2, 3.0] {
+            let lhs = log_normal_pdf(mu + d, mu, 0.7);
+            let rhs = log_normal_pdf(mu - d, mu, 0.7);
+            assert!((lhs - rhs).abs() < 1e-12);
+        }
+    }
+
+    // ---- log_poisson_pmf ----
+
+    #[test]
+    fn log_poisson_pmf_at_zero_is_neg_lambda() {
+        // Pois(0; λ) = e^(-λ).
+        for &lambda in &[0.5, 1.0, 3.7, 25.0] {
+            let got = log_poisson_pmf(0.0, lambda);
+            assert!((got - (-lambda)).abs() < 1e-12, "λ={lambda}");
+        }
+    }
+
+    #[test]
+    fn log_poisson_pmf_normalizes() {
+        // Σ_{y=0..∞} Pois(y; λ) = 1. Truncate at λ+10·√λ which covers >>1-1e-10.
+        let lambda: f64 = 4.0;
+        let cap = (lambda + 10.0 * lambda.sqrt()) as u32;
+        let total: f64 = (0..=cap)
+            .map(|y| log_poisson_pmf(y as f64, lambda).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-9, "sum was {total}");
+    }
+
+    // ---- log_nb_pmf ----
+
+    #[test]
+    fn log_nb_pmf_collapses_to_poisson_as_theta_grows() {
+        // NB(y; μ, θ) → Pois(y; μ) as θ → ∞.
+        let mu = 3.0;
+        let theta = 1e8;
+        for &y in &[0.0, 1.0, 5.0, 10.0] {
+            let nb = log_nb_pmf(y, mu, theta);
+            let pois = log_poisson_pmf(y, mu);
+            assert!((nb - pois).abs() < 1e-4, "y={y}: nb={nb} pois={pois}");
+        }
+    }
+
+    #[test]
+    fn log_nb_pmf_normalizes() {
+        // Σ_y NB(y; μ, θ) = 1.
+        let mu = 2.0;
+        let theta = 1.5;
+        // NB has fatter tails than Poisson; truncate generously.
+        let total: f64 = (0..500)
+            .map(|y| log_nb_pmf(y as f64, mu, theta).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-6, "sum was {total}");
+    }
+
+    // ---- log_binom_pmf ----
+
+    #[test]
+    fn log_binom_pmf_extremes() {
+        // Binom(0; n, p) = (1-p)^n  →  n·ln(1-p).
+        // Binom(n; n, p) = p^n      →  n·ln(p).
+        let n = 10.0;
+        let p = 0.3;
+        let lo = log_binom_pmf(0.0, n, p);
+        let hi = log_binom_pmf(n, n, p);
+        assert!((lo - n * (1.0 - p).ln()).abs() < 1e-12);
+        assert!((hi - n * p.ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn log_binom_pmf_normalizes() {
+        let n = 20;
+        let p = 0.4;
+        let total: f64 = (0..=n)
+            .map(|y| log_binom_pmf(y as f64, n as f64, p).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-10, "sum was {total}");
+    }
+
+    // ---- sigmoid ----
+
+    #[test]
+    fn sigmoid_at_zero_is_half() {
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-15);
+    }
+
+    #[test]
+    fn sigmoid_complement_and_bounded() {
+        // σ(x) + σ(-x) = 1; the function stays in [0, 1] including saturated extremes.
+        for &x in &[-100.0, -3.0, -0.1, 0.7, 5.0, 100.0] {
+            let s = sigmoid(x);
+            assert!(((s + sigmoid(-x)) - 1.0).abs() < 1e-15, "x={x}");
+            assert!((0.0..=1.0).contains(&s), "x={x}: {s}");
+        }
+    }
+
+    #[test]
+    fn sigmoid_monotonic() {
+        let xs = [-5.0, -1.0, -0.1, 0.0, 0.1, 1.0, 5.0];
+        for w in xs.windows(2) {
+            assert!(sigmoid(w[0]) < sigmoid(w[1]), "{} → {}", w[0], w[1]);
+        }
+    }
+
+    // ---- solve_2x2_sym ----
+
+    #[test]
+    fn solve_2x2_sym_identity() {
+        // I·Δ = g  ⇒  Δ = g.
+        let d = solve_2x2_sym([1.0, 0.0, 1.0], [3.0, -4.0]).unwrap();
+        assert!((d[0] - 3.0).abs() < 1e-12);
+        assert!((d[1] + 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn solve_2x2_sym_known_system() {
+        // H = [[2, 1],[1, 3]], g = [5, 10]  ⇒  Δ = [1, 3]
+        // det = 5; Δ = (1/5) · [3·5 - 1·10, -1·5 + 2·10] = (1/5)·[5, 15] = [1, 3].
+        let d = solve_2x2_sym([2.0, 1.0, 3.0], [5.0, 10.0]).unwrap();
+        assert!((d[0] - 1.0).abs() < 1e-12);
+        assert!((d[1] - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn solve_2x2_sym_singular_returns_none() {
+        // [[1, 1],[1, 1]] has det 0.
+        assert!(solve_2x2_sym([1.0, 1.0, 1.0], [1.0, 1.0]).is_none());
+    }
 }

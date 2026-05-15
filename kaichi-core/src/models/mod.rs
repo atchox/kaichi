@@ -15,6 +15,9 @@ pub mod quantiles;
 pub mod ratio;
 pub mod umi;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub trait AssignmentModel: Send + Sync {
     fn name(&self) -> &'static str;
 

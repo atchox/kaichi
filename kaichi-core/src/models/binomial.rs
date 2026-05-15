@@ -229,74 +229,17 @@ fn posterior_signal(y: f64, n: f64, params: FitParams) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{CountMatrix, Covariates, GuideMetadata};
-    use arrow::array::{BooleanArray, Float32Array, StringBuilder};
+    use super::super::test_support::{input_with_row_sums as make_input, input_with_totals};
+    use arrow::array::BooleanArray;
 
-    /// Build input where total_counts equals the row-sum of the count matrix.
-    fn make_input(n_cells: usize, n_guides: usize, triples: Vec<(usize, usize, u32)>) -> LoadedInput {
-        let mut sorted = triples;
-        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
-        let nnz = sorted.len();
-        let mut row_offsets = vec![0usize; n_cells + 1];
-        let mut col_indices = Vec::with_capacity(nnz);
-        let mut values = Vec::with_capacity(nnz);
-        let mut last = 0usize;
-        let mut cell_totals = vec![0u32; n_cells];
-        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
-            while last < r { row_offsets[last + 1] = idx; last += 1; }
-            col_indices.push(c);
-            values.push(v);
-            cell_totals[r] += v;
-        }
-        for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-        let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
-        let mut bc = StringBuilder::new();
-        for i in 0..n_cells { bc.append_value(format!("C{i}")); }
-        let mut gd = StringBuilder::new();
-        for i in 0..n_guides { gd.append_value(format!("g{i}")); }
-        LoadedInput {
-            counts,
-            covariates: Covariates {
-                cell_barcodes: bc.finish(),
-                total_counts: Float32Array::from(cell_totals.iter().map(|&t| t as f32).collect::<Vec<_>>()),
-            },
-            guide_metadata: GuideMetadata { guide_ids: gd.finish() },
-        }
-    }
-
-    /// Build input with explicit per-cell total_counts (needed when cells have non-target guide counts).
     fn make_input_with_totals(
         n_cells: usize,
         n_guides: usize,
         triples: Vec<(usize, usize, u32)>,
         totals: Vec<u32>,
     ) -> LoadedInput {
-        let mut sorted = triples;
-        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
-        let nnz = sorted.len();
-        let mut row_offsets = vec![0usize; n_cells + 1];
-        let mut col_indices = Vec::with_capacity(nnz);
-        let mut values = Vec::with_capacity(nnz);
-        let mut last = 0usize;
-        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
-            while last < r { row_offsets[last + 1] = idx; last += 1; }
-            col_indices.push(c);
-            values.push(v);
-        }
-        for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-        let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
-        let mut bc = StringBuilder::new();
-        for i in 0..n_cells { bc.append_value(format!("C{i}")); }
-        let mut gd = StringBuilder::new();
-        for i in 0..n_guides { gd.append_value(format!("g{i}")); }
-        LoadedInput {
-            counts,
-            covariates: Covariates {
-                cell_barcodes: bc.finish(),
-                total_counts: Float32Array::from(totals.iter().map(|&t| t as f32).collect::<Vec<_>>()),
-            },
-            guide_metadata: GuideMetadata { guide_ids: gd.finish() },
-        }
+        input_with_totals(n_cells, n_guides, triples,
+            totals.iter().map(|&t| t as f32).collect())
     }
 
     fn is_unassigned(r: &AssignmentResult) -> &BooleanArray {
@@ -368,5 +311,60 @@ mod tests {
         let is_multi = result.batch.column_by_name("is_multi_infected").unwrap()
             .as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(is_multi.value(3), "cell 3 should be multi-infected");
+    }
+
+    // ---- posterior_signal (Binomial Bayes) ----
+
+    #[test]
+    fn binomial_posterior_equals_pi_when_components_identical() {
+        // β1 = 0 ⇒ p_signal = p_bg ⇒ likelihoods identical ⇒ posterior = π.
+        for &pi in &[0.05, 0.3, 0.5, 0.8, 0.95] {
+            let p = FitParams { pi, beta0: -2.0, beta1: 0.0 };
+            let post = posterior_signal(5.0, 50.0, p);
+            assert!((post - pi).abs() < 1e-12, "π={pi}: got {post}");
+        }
+    }
+
+    #[test]
+    fn binomial_posterior_monotonic_in_y_when_beta1_positive() {
+        // logit(p_bg) = -3, logit(p_sig) = 1 ⇒ p_bg ≈ 0.047, p_sig ≈ 0.73.
+        // Saturates rapidly under f64; test non-decreasing globally and strict
+        // monotonicity in the un-saturated low-y range.
+        let p = FitParams { pi: 0.3, beta0: -3.0, beta1: 4.0 };
+        let n = 50.0;
+        let ys = [0.0, 1.0, 5.0, 10.0, 15.0, 30.0, 45.0];
+        let posts: Vec<f64> = ys.iter().map(|&y| posterior_signal(y, n, p)).collect();
+        for w in posts.windows(2) {
+            assert!(w[1] >= w[0], "posterior decreased: {} → {}", w[0], w[1]);
+        }
+        // Strict increase over the un-saturated stretch (y = 0..10).
+        assert!(posts[0] < posts[3], "no strict increase 0 → 10: {} → {}", posts[0], posts[3]);
+    }
+
+    #[test]
+    fn binomial_posterior_saturates() {
+        // p_bg ≈ 0.047, p_sig ≈ 0.73; y=45/50 is overwhelmingly signal, y=0/50 overwhelmingly bg.
+        let p = FitParams { pi: 0.2, beta0: -3.0, beta1: 4.0 };
+        assert!(posterior_signal(45.0, 50.0, p) > 0.99);
+        assert!(posterior_signal(0.0, 50.0, p) < 0.2);
+    }
+
+    // ---- fit_mixture: synthetic recovery ----
+
+    #[test]
+    fn fit_mixture_recovers_bimodal_binomial() {
+        // 12 background (1–2 of 50, prop ≈ 0.03) + 8 signal (38–45 of 50, prop ≈ 0.83).
+        let n = 50.0;
+        let mut data: Vec<(f64, f64)> = (0..12).map(|i| (1.0 + (i % 2) as f64, n)).collect();
+        data.extend((0..8).map(|i| (38.0 + i as f64, n)));
+
+        let fitted = fit_mixture(&data, 200, 25, 1e-8);
+        let p_bg = sigmoid(fitted.beta0);
+        let p_sig = sigmoid(fitted.beta0 + fitted.beta1);
+
+        assert!(p_sig > p_bg, "p_sig={p_sig} ≤ p_bg={p_bg}");
+        assert!(p_bg < 0.10, "p_bg should track low cluster (~0.03), got {p_bg}");
+        assert!(p_sig > 0.70, "p_sig should track high cluster (~0.83), got {p_sig}");
+        assert!((0.2..=0.6).contains(&fitted.pi), "pi: {}", fitted.pi);
     }
 }

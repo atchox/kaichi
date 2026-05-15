@@ -257,7 +257,8 @@ fn fit_beta2(props: &[f64], max_em_iters: u32, tol: f64) -> Beta2Params {
     )
 }
 
-fn m_step_beta2(params: Beta2Params, props: &[f64], r_h: &[f64]) -> Beta2Params {
+fn m_step_beta2(_params: Beta2Params, props: &[f64], r_h: &[f64]) -> Beta2Params {
+    // pi = weight of the HIGH component = E[z_i = high].
     let pi = clamp_probability(r_h.iter().sum::<f64>() / props.len() as f64);
 
     // Method of moments per component.
@@ -265,14 +266,14 @@ fn m_step_beta2(params: Beta2Params, props: &[f64], r_h: &[f64]) -> Beta2Params 
     let (ah, bh) = beta_mom_weighted(props, r_h, true);
 
     // Sort: ensure l component has lower mean than h.
+    // When components swap labels, pi (the weight of the HIGH component) must also swap.
     let mean_l = al / (al + bl);
     let mean_h = ah / (ah + bh);
     if mean_l <= mean_h {
         Beta2Params { pi, al, bl, ah, bh }
     } else {
-        Beta2Params { pi, al: ah, bl: bh, ah: al, bh: bl }
+        Beta2Params { pi: 1.0 - pi, al: ah, bl: bh, ah: al, bh: bl }
     }
-    // If components swap, also swap pi (but use the current pi as is; it'll re-sort next iter).
 }
 
 fn posterior_high_2(x: f64, params: Beta2Params) -> f64 {
@@ -320,7 +321,7 @@ fn fit_beta3(props: &[f64], max_em_iters: u32, tol: f64) -> Beta3Params {
     )
 }
 
-fn m_step_beta3(params: Beta3Params, props: &[f64], r: &[[f64; 3]]) -> Beta3Params {
+fn m_step_beta3(_params: Beta3Params, props: &[f64], r: &[[f64; 3]]) -> Beta3Params {
     let n = props.len() as f64;
     let sum_rl: f64 = r.iter().map(|ri| ri[0]).sum();
     let sum_rm: f64 = r.iter().map(|ri| ri[1]).sum();
@@ -383,11 +384,7 @@ fn beta_mom_weighted(props: &[f64], weights: &[f64], signal_weight: bool) -> (f6
         let phi = if signal_weight { 10.0 } else { 1.0 };
         return (mean.max(0.01) * phi, (1.0 - mean.max(0.01).min(0.99)) * phi);
     }
-    let phi = mean * (1.0 - mean) / var - 1.0;
-    if phi <= 0.0 {
-        let phi = 1.0;
-        return (mean * phi, (1.0 - mean) * phi);
-    }
+    let phi = (mean * (1.0 - mean) / var - 1.0).max(0.1);
     (mean * phi, (1.0 - mean) * phi)
 }
 
@@ -398,79 +395,48 @@ fn beta_mom_weighted(props: &[f64], weights: &[f64], signal_weight: bool) -> (f6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{CountMatrix, Covariates, GuideMetadata};
-    use arrow::array::{BooleanArray, Float32Array, StringBuilder};
-
-    fn make_input(n_cells: usize, n_guides: usize, triples: Vec<(usize, usize, u32)>) -> LoadedInput {
-        let mut sorted = triples;
-        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
-        let nnz = sorted.len();
-        let mut row_offsets = vec![0usize; n_cells + 1];
-        let mut col_indices = Vec::with_capacity(nnz);
-        let mut values = Vec::with_capacity(nnz);
-        let mut last = 0usize;
-        let mut cell_totals = vec![0u32; n_cells];
-        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
-            while last < r { row_offsets[last + 1] = idx; last += 1; }
-            col_indices.push(c);
-            values.push(v);
-            cell_totals[r] += v;
-        }
-        for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-        let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
-        let mut bc = StringBuilder::new();
-        for i in 0..n_cells { bc.append_value(format!("C{i}")); }
-        let mut gd = StringBuilder::new();
-        for i in 0..n_guides { gd.append_value(format!("g{i}")); }
-        LoadedInput {
-            counts,
-            covariates: Covariates {
-                cell_barcodes: bc.finish(),
-                total_counts: Float32Array::from(cell_totals.iter().map(|&t| t as f32).collect::<Vec<_>>()),
-            },
-            guide_metadata: GuideMetadata { guide_ids: gd.finish() },
-        }
-    }
+    use super::super::test_support::{input_with_row_sums as make_input, input_with_totals};
+    use crate::data::CountMatrix;
+    use arrow::array::{BooleanArray, Float32Array};
 
     fn is_unassigned(r: &AssignmentResult) -> &BooleanArray {
         r.batch.column_by_name("is_unassigned").unwrap()
             .as_any().downcast_ref::<BooleanArray>().unwrap()
     }
 
-    // Build input with explicit per-cell total_counts (for multi-guide cells where
-    // one guide dominates the proportion).
     fn make_input_with_totals(
         n_cells: usize,
         n_guides: usize,
         triples: Vec<(usize, usize, u32)>,
         totals: Vec<u32>,
     ) -> LoadedInput {
-        let mut sorted = triples;
-        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
-        let nnz = sorted.len();
-        let mut row_offsets = vec![0usize; n_cells + 1];
-        let mut col_indices = Vec::with_capacity(nnz);
-        let mut values = Vec::with_capacity(nnz);
-        let mut last = 0usize;
-        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
-            while last < r { row_offsets[last + 1] = idx; last += 1; }
-            col_indices.push(c);
-            values.push(v);
-        }
-        for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-        let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
-        let mut bc = StringBuilder::new();
-        for i in 0..n_cells { bc.append_value(format!("C{i}")); }
-        let mut gd = StringBuilder::new();
-        for i in 0..n_guides { gd.append_value(format!("g{i}")); }
-        LoadedInput {
-            counts,
-            covariates: Covariates {
-                cell_barcodes: bc.finish(),
-                total_counts: Float32Array::from(totals.iter().map(|&t| t as f32).collect::<Vec<_>>()),
-            },
-            guide_metadata: GuideMetadata { guide_ids: gd.finish() },
-        }
+        input_with_totals(n_cells, n_guides, triples,
+            totals.iter().map(|&t| t as f32).collect())
+    }
+
+    #[test]
+    fn m_step_beta2_swaps_pi_with_components() {
+        // Construct responsibilities where r_h is assigned to the LOW-proportion data
+        // (components need to swap). After the swap, pi should equal 1 - original_pi.
+        let props: Vec<f64> = vec![0.1, 0.1, 0.1, 0.9, 0.9];
+        // r_h = responsibility for the "high" label — but let's deliberately assign
+        // high responsibility to the low-proportion cells so components must swap.
+        let r_h: Vec<f64> = vec![0.9, 0.9, 0.9, 0.1, 0.1];
+
+        // Before the m_step call, "pi" from r_h.sum/n = 0.9*3 + 0.1*2 = 2.9 / 5 = 0.58.
+        // After MOM, the component fit to r_h weights has low mean (≈ 0.1) and the
+        // component fit to (1-r_h) weights has high mean (≈ 0.9). Labels must swap.
+        // pi after swap must be 1.0 - 0.58 = 0.42.
+        let dummy_params = Beta2Params { pi: 0.5, al: 1.0, bl: 10.0, ah: 10.0, bh: 1.0 };
+        let result = m_step_beta2(dummy_params, &props, &r_h);
+
+        assert!(result.ah / (result.ah + result.bh) > result.al / (result.al + result.bl),
+            "high component should have higher mean than low after m_step");
+        // When components swap, pi should be approximately 1 - (r_h.sum/n).
+        let original_pi = r_h.iter().sum::<f64>() / r_h.len() as f64;
+        let expected_pi_after_swap = 1.0 - original_pi;
+        assert!((result.pi - expected_pi_after_swap).abs() < 1e-6,
+            "pi should be swapped: expected {expected_pi_after_swap:.4}, got {:.4}", result.pi);
     }
 
     #[test]
@@ -558,5 +524,239 @@ mod tests {
             assert!(result.batch.column_by_name("guide_id").unwrap().is_null(i));
             assert!(result.batch.column_by_name("umi_count").unwrap().is_null(i));
         }
+    }
+
+    // ---- beta_mom_weighted (the moment-match identity) ----
+
+    #[test]
+    fn mom_recovers_mean_and_variance_at_uniform_weights() {
+        // Identity: for Beta(α, β) the relations
+        //   mean = α/(α+β),  var = α·β / [(α+β)²·(α+β+1)]
+        // are equivalent to  φ = α+β = mean·(1-mean)/var - 1.
+        // With uniform weights, MOM must round-trip mean and var exactly.
+        let xs = [0.05, 0.10, 0.20, 0.35, 0.55, 0.80, 0.95];
+        let w = vec![1.0; xs.len()];
+
+        let mean = xs.iter().sum::<f64>() / xs.len() as f64;
+        let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / xs.len() as f64;
+
+        let (a, b) = beta_mom_weighted(&xs, &w, true);
+
+        let recovered_mean = a / (a + b);
+        let recovered_var = (a * b) / ((a + b).powi(2) * (a + b + 1.0));
+
+        assert!((recovered_mean - mean).abs() < 1e-12, "mean: got {recovered_mean}, want {mean}");
+        assert!((recovered_var - var).abs() < 1e-12, "var: got {recovered_var}, want {var}");
+    }
+
+    #[test]
+    fn mom_signal_weight_flag_inverts_weights() {
+        // Passing signal_weight=false should fit the SAME (α, β) we'd get by passing
+        // signal_weight=true with explicitly inverted weights.
+        let xs = [0.1, 0.2, 0.6, 0.8, 0.9];
+        let r = [0.9, 0.7, 0.5, 0.3, 0.1];
+        let r_inv: Vec<f64> = r.iter().map(|&v| 1.0 - v).collect();
+
+        let (a1, b1) = beta_mom_weighted(&xs, &r, false);
+        let (a2, b2) = beta_mom_weighted(&xs, &r_inv, true);
+
+        assert!((a1 - a2).abs() < 1e-12 && (b1 - b2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mom_returns_fallback_when_weights_vanish() {
+        // sum_w < 1e-6 → uninformative Beta(1, 1).
+        let xs = [0.3, 0.7];
+        let zero = [0.0, 0.0];
+        let (a, b) = beta_mom_weighted(&xs, &zero, true);
+        assert_eq!((a, b), (1.0, 1.0));
+    }
+
+    #[test]
+    fn mom_handles_degenerate_zero_variance() {
+        // All observations equal → var=0 → degenerate branch must not produce NaN/Inf.
+        let xs = [0.4, 0.4, 0.4];
+        let w = [1.0, 1.0, 1.0];
+        let (a, b) = beta_mom_weighted(&xs, &w, true);
+        assert!(a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0);
+    }
+
+    // ---- max_proportions ----
+
+    fn csr_from_triples(n_cells: usize, n_guides: usize, triples: &[(usize, usize, u32)])
+        -> nalgebra_sparse::CsrMatrix<u32>
+    {
+        let mut sorted = triples.to_vec();
+        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
+        let mut row_offsets = vec![0usize; n_cells + 1];
+        let mut col_indices = Vec::with_capacity(sorted.len());
+        let mut values = Vec::with_capacity(sorted.len());
+        let mut last = 0usize;
+        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
+            while last < r { row_offsets[last + 1] = idx; last += 1; }
+            col_indices.push(c);
+            values.push(v);
+        }
+        for i in (last + 1)..=n_cells { row_offsets[i] = sorted.len(); }
+        let counts = CountMatrix::try_from_csr(
+            n_cells, n_guides, row_offsets, col_indices, values).unwrap();
+        counts.csr().clone()
+    }
+
+    #[test]
+    fn max_proportions_picks_largest_guide() {
+        // Cell 0: g0=2, g1=8 → max_prop = 8/10 = 0.8, guide = 1, count = 8.
+        let csr = csr_from_triples(1, 2, &[(0, 0, 2), (0, 1, 8)]);
+        let totals = Float32Array::from(vec![10.0]);
+        let props = max_proportions(&csr, 1, &totals, 1e-4, 1.0 - 1e-4);
+        assert_eq!(props.len(), 1);
+        let (p, g, c) = props[0];
+        assert!((p - 0.8).abs() < 1e-12);
+        assert_eq!(g, 1);
+        assert_eq!(c, 8);
+    }
+
+    #[test]
+    fn max_proportions_zero_total_yields_zero_tuple() {
+        // total_counts = 0 → returns (0.0, 0, 0) regardless of sparse content.
+        let csr = csr_from_triples(2, 2, &[]);
+        let totals = Float32Array::from(vec![0.0, 0.0]);
+        let props = max_proportions(&csr, 2, &totals, 1e-4, 1.0 - 1e-4);
+        for (p, g, c) in &props {
+            assert_eq!((*p, *g, *c), (0.0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn max_proportions_clamps_to_bounds() {
+        // p = 1.0 exactly clamps down to clamp_hi (Beta pdf undefined at 1.0).
+        let csr = csr_from_triples(1, 1, &[(0, 0, 5)]);
+        let totals = Float32Array::from(vec![5.0]);
+        let props = max_proportions(&csr, 1, &totals, 1e-4, 0.9999);
+        assert!((props[0].0 - 0.9999).abs() < 1e-12);
+    }
+
+    #[test]
+    fn max_proportions_ties_keep_first_seen() {
+        // Strict `>` in the inner loop → first guide seen at the max wins.
+        let csr = csr_from_triples(1, 2, &[(0, 0, 5), (0, 1, 5)]);
+        let totals = Float32Array::from(vec![10.0]);
+        let props = max_proportions(&csr, 1, &totals, 1e-4, 0.9999);
+        assert_eq!(props[0].1, 0, "tie should resolve to lowest guide index");
+    }
+
+    // ---- posterior_high_2 ----
+
+    #[test]
+    fn posterior_equals_pi_when_components_identical() {
+        // Identical components ⇒ likelihood ratio = 1 ⇒ posterior = π.
+        for &pi in &[0.1, 0.3, 0.5, 0.7, 0.9] {
+            let p = Beta2Params { pi, al: 5.0, bl: 5.0, ah: 5.0, bh: 5.0 };
+            let post = posterior_high_2(0.42, p);
+            assert!((post - pi).abs() < 1e-12, "π={pi}: got {post}");
+        }
+    }
+
+    #[test]
+    fn posterior_saturates_with_extreme_pi() {
+        // pi just above the clamp floor → posterior pinned near 0; just below the cap → near 1.
+        // (We use clamp bounds 1e-6 because the EM clamps pi via clamp_probability.)
+        let p_lo = Beta2Params { pi: 1e-6, al: 1.0, bl: 10.0, ah: 10.0, bh: 1.0 };
+        let p_hi = Beta2Params { pi: 1.0 - 1e-6, al: 1.0, bl: 10.0, ah: 10.0, bh: 1.0 };
+        assert!(posterior_high_2(0.5, p_lo) < 1e-5);
+        assert!(posterior_high_2(0.5, p_hi) > 1.0 - 1e-5);
+    }
+
+    #[test]
+    fn posterior_monotonic_when_signal_mean_higher() {
+        // Background Beta(1, 10) (mean ≈ 0.09), signal Beta(10, 1) (mean ≈ 0.91), pi=0.4.
+        // posterior_high_2 must be monotonically increasing in x.
+        let p = Beta2Params { pi: 0.4, al: 1.0, bl: 10.0, ah: 10.0, bh: 1.0 };
+        let xs = [0.05, 0.15, 0.30, 0.50, 0.70, 0.85, 0.95];
+        let mut prev = -1.0;
+        for x in xs {
+            let post = posterior_high_2(x, p);
+            assert!(post > prev, "non-monotonic at x={x}: prev={prev}, post={post}");
+            prev = post;
+        }
+    }
+
+    #[test]
+    fn posterior_crossover_at_half_when_weights_equal() {
+        // π=0.5 with mirrored Beta(α,β) and Beta(β,α): equal density at x=0.5 → post = 0.5.
+        let p = Beta2Params { pi: 0.5, al: 3.0, bl: 8.0, ah: 8.0, bh: 3.0 };
+        assert!((posterior_high_2(0.5, p) - 0.5).abs() < 1e-12);
+    }
+
+    // ---- m_step_beta2 (perfect-responsibility recovery) ----
+
+    #[test]
+    fn m_step_recovers_two_clusters_with_perfect_responsibilities() {
+        // Two clusters at means 0.2 and 0.8, equal sizes, hard assignment.
+        // MOM on each half should give means 0.2 and 0.8 (within tolerance).
+        let lo = vec![0.15, 0.20, 0.25];
+        let hi = vec![0.75, 0.80, 0.85];
+        let props: Vec<f64> = lo.iter().chain(hi.iter()).copied().collect();
+        // r_h = 1 for hi cluster, 0 for lo cluster.
+        let r_h: Vec<f64> = lo.iter().map(|_| 0.0).chain(hi.iter().map(|_| 1.0)).collect();
+
+        let dummy = Beta2Params { pi: 0.5, al: 1.0, bl: 1.0, ah: 1.0, bh: 1.0 };
+        let out = m_step_beta2(dummy, &props, &r_h);
+
+        let mean_l = out.al / (out.al + out.bl);
+        let mean_h = out.ah / (out.ah + out.bh);
+        assert!((mean_l - 0.20).abs() < 1e-12, "mean_l = {mean_l}");
+        assert!((mean_h - 0.80).abs() < 1e-12, "mean_h = {mean_h}");
+        assert!((out.pi - 0.5).abs() < 1e-12, "pi = {}", out.pi);
+    }
+
+    // ---- fit_beta2 end-to-end on synthetic data ----
+
+    fn sample_beta(alpha: f64, beta_: f64, n: usize, seed: u64) -> Vec<f64> {
+        // Mersenne-twister-free deterministic Beta sampler via inverse-CDF on a LCG.
+        // Adequate for tests where we only check approximate recovery, not draw fidelity.
+        // Use the gamma-ratio identity: X ~ Beta(α, β) iff X = G_α/(G_α + G_β), G ~ Gamma.
+        // Approximate Gamma via the Marsaglia–Tsang transform isn't worth the complexity;
+        // instead we use a coarse but adequate transform: sum of -log(U)/α for shape α.
+        // (Valid only for shape ≥ 1; we pick α, β ≥ 1 in the test that uses this.)
+        use std::num::Wrapping;
+        let mut state = Wrapping(seed.max(1));
+        let mut next = || {
+            state = state * Wrapping(6364136223846793005u64) + Wrapping(1442695040888963407u64);
+            // uniform in (0, 1)
+            ((state.0 >> 11) as f64 + 1.0) / ((1u64 << 53) as f64 + 1.0)
+        };
+        let gamma = |shape: f64, draw: &mut dyn FnMut() -> f64| -> f64 {
+            // sum of `shape` exponentials, fractional part via Whittaker — coarse.
+            let k = shape.floor() as usize;
+            let mut s = 0.0;
+            for _ in 0..k { s += -draw().ln(); }
+            s
+        };
+        (0..n).map(|_| {
+            let ga = gamma(alpha, &mut next);
+            let gb = gamma(beta_, &mut next);
+            ga / (ga + gb)
+        }).collect()
+    }
+
+    #[test]
+    fn fit_beta2_recovers_well_separated_clusters() {
+        // Mix 70% Beta(2, 18) (mean 0.1) + 30% Beta(18, 2) (mean 0.9).
+        // After EM, signal component (higher mean) should land near 0.9.
+        let mut data = sample_beta(2.0, 18.0, 700, 42);
+        data.extend(sample_beta(18.0, 2.0, 300, 7));
+        // Clamp away from the boundaries the model expects.
+        for x in &mut data { *x = x.clamp(1e-4, 1.0 - 1e-4); }
+
+        let fitted = fit_beta2(&data, 500, 1e-8);
+        let mean_h = fitted.ah / (fitted.ah + fitted.bh);
+        let mean_l = fitted.al / (fitted.al + fitted.bl);
+
+        assert!(mean_h > mean_l, "signal mean must exceed background mean");
+        assert!((mean_h - 0.9).abs() < 0.05, "mean_h drifted: {mean_h}");
+        assert!((mean_l - 0.1).abs() < 0.05, "mean_l drifted: {mean_l}");
+        // 30% signal weight (give EM some slack).
+        assert!((fitted.pi - 0.3).abs() < 0.10, "pi drifted: {}", fitted.pi);
     }
 }

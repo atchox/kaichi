@@ -315,39 +315,8 @@ fn trigamma(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{CountMatrix, Covariates, GuideMetadata};
-    use arrow::array::{BooleanArray, Float32Array, StringBuilder};
-
-    fn make_input(n_cells: usize, n_guides: usize, triples: Vec<(usize, usize, u32)>) -> LoadedInput {
-        let mut sorted = triples;
-        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
-        let nnz = sorted.len();
-        let mut row_offsets = vec![0usize; n_cells + 1];
-        let mut col_indices = Vec::with_capacity(nnz);
-        let mut values = Vec::with_capacity(nnz);
-        let mut last = 0usize;
-        let mut cell_totals = vec![0u32; n_cells];
-        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
-            while last < r { row_offsets[last + 1] = idx; last += 1; }
-            col_indices.push(c);
-            values.push(v);
-            cell_totals[r] += v;
-        }
-        for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-        let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
-        let mut bc = StringBuilder::new();
-        for i in 0..n_cells { bc.append_value(format!("C{i}")); }
-        let mut gd = StringBuilder::new();
-        for i in 0..n_guides { gd.append_value(format!("g{i}")); }
-        LoadedInput {
-            counts,
-            covariates: Covariates {
-                cell_barcodes: bc.finish(),
-                total_counts: Float32Array::from(cell_totals.iter().map(|&t| t as f32).collect::<Vec<_>>()),
-            },
-            guide_metadata: GuideMetadata { guide_ids: gd.finish() },
-        }
-    }
+    use super::super::test_support::{input_with_row_sums as make_input, input_with_totals};
+    use arrow::array::BooleanArray;
 
     fn make_input_with_totals(
         n_cells: usize,
@@ -355,32 +324,8 @@ mod tests {
         triples: Vec<(usize, usize, u32)>,
         totals: Vec<u32>,
     ) -> LoadedInput {
-        let mut sorted = triples;
-        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
-        let nnz = sorted.len();
-        let mut row_offsets = vec![0usize; n_cells + 1];
-        let mut col_indices = Vec::with_capacity(nnz);
-        let mut values = Vec::with_capacity(nnz);
-        let mut last = 0usize;
-        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
-            while last < r { row_offsets[last + 1] = idx; last += 1; }
-            col_indices.push(c);
-            values.push(v);
-        }
-        for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-        let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
-        let mut bc = StringBuilder::new();
-        for i in 0..n_cells { bc.append_value(format!("C{i}")); }
-        let mut gd = StringBuilder::new();
-        for i in 0..n_guides { gd.append_value(format!("g{i}")); }
-        LoadedInput {
-            counts,
-            covariates: Covariates {
-                cell_barcodes: bc.finish(),
-                total_counts: Float32Array::from(totals.iter().map(|&t| t as f32).collect::<Vec<_>>()),
-            },
-            guide_metadata: GuideMetadata { guide_ids: gd.finish() },
-        }
+        input_with_totals(n_cells, n_guides, triples,
+            totals.iter().map(|&t| t as f32).collect())
     }
 
     fn is_unassigned(r: &AssignmentResult) -> &BooleanArray {
@@ -443,5 +388,97 @@ mod tests {
         let t2 = trigamma(2.0);
         assert!((t1 - std::f64::consts::PI.powi(2) / 6.0).abs() < 1e-4, "trigamma(1) ≈ π²/6");
         assert!((t2 - (std::f64::consts::PI.powi(2) / 6.0 - 1.0)).abs() < 1e-4, "trigamma(2)");
+    }
+
+    #[test]
+    fn trigamma_recurrence_holds() {
+        // ψ'(x+1) = ψ'(x) - 1/x². Verified across the recurrence regime (<6) and the
+        // asymptotic regime (≥6) — independent of which branch the implementation hits.
+        // The asymptotic expansion has ~1e-7 truncation error at the recurrence boundary;
+        // away from x=6 the error drops to machine precision. 1e-6 is loose enough for the
+        // boundary and still tight enough to catch any real implementation bug.
+        for &x in &[0.5, 1.0, 1.5, 2.7, 3.3, 4.9, 5.9, 6.0, 6.5, 12.3, 100.0] {
+            let lhs = trigamma(x + 1.0);
+            let rhs = trigamma(x) - 1.0 / (x * x);
+            assert!((lhs - rhs).abs() < 1e-6, "x={x}: lhs={lhs}, rhs={rhs}, diff={}", (lhs - rhs).abs());
+        }
+    }
+
+    // ---- posterior_signal (NB Bayes) ----
+
+    #[test]
+    fn nb_posterior_equals_pi_when_components_identical() {
+        // β1 = 0 ⇒ μ_signal = μ_bg ⇒ likelihoods identical ⇒ posterior = π.
+        for &pi in &[0.05, 0.3, 0.5, 0.8, 0.95] {
+            let p = FitParams { pi, beta0: -1.0, beta1: 0.0, log_theta: 1.0 };
+            let post = posterior_signal(3.0, 2.0, p);
+            assert!((post - pi).abs() < 1e-12, "π={pi}: got {post}");
+        }
+    }
+
+    #[test]
+    fn nb_posterior_monotonic_in_y_when_beta1_positive() {
+        // With β1 > 0 (signal mean > background mean), bigger y favors signal.
+        let p = FitParams { pi: 0.3, beta0: -1.5, beta1: 2.0, log_theta: 1.0 };
+        let log_d = (50.0_f64 + 1.0).ln();
+        let ys = [0.0, 1.0, 3.0, 8.0, 20.0, 50.0];
+        let mut prev = -1.0;
+        for y in ys {
+            let post = posterior_signal(y, log_d, p);
+            assert!(post > prev, "non-monotonic at y={y}: prev={prev}, post={post}");
+            prev = post;
+        }
+    }
+
+    #[test]
+    fn nb_posterior_saturates_at_very_large_y() {
+        // y much greater than μ_bg, smaller than μ_sig: posterior near 1.
+        let p = FitParams { pi: 0.2, beta0: 0.0, beta1: 3.0, log_theta: 5.0 };
+        // log_d = 0 so μ_bg = e⁰ = 1, μ_sig = e³ ≈ 20.
+        assert!(posterior_signal(50.0, 0.0, p) > 0.99);
+        // At y=0, well within the background range → posterior < π.
+        assert!(posterior_signal(0.0, 0.0, p) < 0.2);
+    }
+
+    // ---- fit_mixture: synthetic recovery ----
+
+    #[test]
+    fn fit_mixture_recovers_bimodal_nb() {
+        // 15 background counts 0–2, 10 signal counts 18–27. All cells at depth 50.
+        let log_d = (50.0_f64 + 1.0).ln();
+        let mut data: Vec<(f64, f64)> = (0..15).map(|i| ((i % 3) as f64, log_d)).collect();
+        data.extend((0..10).map(|i| (18.0 + i as f64, log_d)));
+
+        let fitted = fit_mixture(
+            &data, 200, 25, 1e-8,
+            5.0_f64.ln(), 0.01_f64.ln(), 1e4_f64.ln(),
+        );
+
+        let mu_bg = (fitted.beta0 + log_d).exp();
+        let mu_sig = (fitted.beta0 + fitted.beta1 + log_d).exp();
+
+        assert!(mu_sig > mu_bg, "μ_sig={mu_sig} should exceed μ_bg={mu_bg}");
+        assert!(mu_bg < 5.0, "μ_bg should track the low cluster, got {mu_bg}");
+        assert!(mu_sig > 15.0, "μ_sig should track the high cluster, got {mu_sig}");
+        // ~10/25 = 0.4 signal weight; allow slack since EM can drift.
+        assert!((0.2..=0.6).contains(&fitted.pi), "pi drifted: {}", fitted.pi);
+    }
+
+    #[test]
+    fn fit_mixture_respects_theta_clamp() {
+        // log_theta_max bounds θ from above. If the data is exactly Poisson (θ → ∞),
+        // log_theta must stop at log_theta_max instead of running off.
+        let log_d = (100.0_f64 + 1.0).ln();
+        // Counts with no overdispersion (handcrafted, all near means).
+        let data: Vec<(f64, f64)> = (0..15)
+            .map(|i| if i < 10 { 1.0 } else { 20.0 })
+            .map(|y| (y, log_d))
+            .collect();
+        let cap_log = 3.0; // ln(20) ≈ 3.0
+        let fitted = fit_mixture(&data, 200, 25, 1e-8, 1.0, -4.0, cap_log);
+        assert!(
+            fitted.log_theta <= cap_log + 1e-9,
+            "log_theta {} exceeded cap {cap_log}", fitted.log_theta
+        );
     }
 }

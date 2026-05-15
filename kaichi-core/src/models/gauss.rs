@@ -534,4 +534,14 @@ mod tests {
             "more zeros should pull mu_bg toward 0"
         );
     }
+
+    #[test]
+    fn gauss_posterior_equals_pi_when_components_identical() {
+        // μ_signal = μ_bg ⇒ Gaussian densities equal at every x ⇒ posterior = π.
+        for &pi in &[0.05, 0.3, 0.5, 0.8, 0.95] {
+            let p = FitParams { pi, mu_bg: 0.5, mu_signal: 0.5, sigma: 0.3 };
+            let post = posterior_signal(1.234, p);
+            assert!((post - pi).abs() < 1e-12, "π={pi}: got {post}");
+        }
+    }
 }
