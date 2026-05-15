@@ -293,6 +293,7 @@ mod tests {
             covariates: Covariates {
                 cell_barcodes: bc.finish(),
                 total_counts: Float32Array::from(vec![0.0f32; n_cells]),
+                batch: crate::data::BatchLabels::single_batch(n_cells),
             },
             guide_metadata: GuideMetadata { guide_ids: gd.finish() },
         }

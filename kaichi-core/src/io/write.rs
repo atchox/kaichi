@@ -287,6 +287,7 @@ mod tests {
         let covariates = Covariates {
             cell_barcodes: bc.finish(),
             total_counts: Float32Array::from(vec![1.0f32, 1.0, 25.0, 30.0]),
+            batch: crate::data::BatchLabels::single_batch(4),
         };
 
         let mut gd = StringBuilder::new();
@@ -535,6 +536,7 @@ mod tests {
             covariates: Covariates {
                 cell_barcodes: bc.finish(),
                 total_counts: Float32Array::from(vec![45.0f32]),
+                batch: crate::data::BatchLabels::single_batch(1),
             },
             guide_metadata: GuideMetadata { guide_ids: gd.finish() },
         };

@@ -6,7 +6,7 @@
 
 #![cfg(test)]
 
-use crate::data::{CountMatrix, Covariates, GuideMetadata, LoadedInput};
+use crate::data::{BatchLabels, CountMatrix, Covariates, GuideMetadata, LoadedInput};
 use arrow::array::{Float32Array, StringBuilder};
 
 /// Build a `LoadedInput` from sparse `(row, col, value)` triples.
@@ -56,6 +56,7 @@ pub fn input_with_totals(
         covariates: Covariates {
             cell_barcodes: bc.finish(),
             total_counts: Float32Array::from(totals),
+            batch: BatchLabels::single_batch(n_cells),
         },
         guide_metadata: GuideMetadata { guide_ids: gd.finish() },
     }

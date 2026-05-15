@@ -118,39 +118,8 @@ impl AssignmentModel for QuantilesModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{CountMatrix, Covariates, GuideMetadata};
-    use arrow::array::{BooleanArray, Float32Array, StringBuilder};
-
-    fn make_input(n_cells: usize, n_guides: usize, triples: Vec<(usize, usize, u32)>) -> LoadedInput {
-        let mut sorted = triples;
-        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
-        let nnz = sorted.len();
-        let mut row_offsets = vec![0usize; n_cells + 1];
-        let mut col_indices = Vec::with_capacity(nnz);
-        let mut values = Vec::with_capacity(nnz);
-        let mut last = 0usize;
-        let mut cell_totals = vec![0u32; n_cells];
-        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
-            while last < r { row_offsets[last + 1] = idx; last += 1; }
-            col_indices.push(c);
-            values.push(v);
-            cell_totals[r] += v;
-        }
-        for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-        let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
-        let mut bc = StringBuilder::new();
-        for i in 0..n_cells { bc.append_value(format!("C{i}")); }
-        let mut gd = StringBuilder::new();
-        for i in 0..n_guides { gd.append_value(format!("g{i}")); }
-        LoadedInput {
-            counts,
-            covariates: Covariates {
-                cell_barcodes: bc.finish(),
-                total_counts: Float32Array::from(cell_totals.iter().map(|&t| t as f32).collect::<Vec<_>>()),
-            },
-            guide_metadata: GuideMetadata { guide_ids: gd.finish() },
-        }
-    }
+    use super::super::test_support::{input_with_row_sums as make_input, input_with_totals};
+    use arrow::array::BooleanArray;
 
     fn make_input_with_totals(
         n_cells: usize,
@@ -158,32 +127,8 @@ mod tests {
         triples: Vec<(usize, usize, u32)>,
         totals: Vec<u32>,
     ) -> LoadedInput {
-        let mut sorted = triples;
-        sorted.sort_unstable_by_key(|&(r, c, _)| (r, c));
-        let nnz = sorted.len();
-        let mut row_offsets = vec![0usize; n_cells + 1];
-        let mut col_indices = Vec::with_capacity(nnz);
-        let mut values = Vec::with_capacity(nnz);
-        let mut last = 0usize;
-        for (idx, &(r, c, v)) in sorted.iter().enumerate() {
-            while last < r { row_offsets[last + 1] = idx; last += 1; }
-            col_indices.push(c);
-            values.push(v);
-        }
-        for i in (last + 1)..=n_cells { row_offsets[i] = nnz; }
-        let counts = CountMatrix::try_from_csr(n_cells, n_guides, row_offsets, col_indices, values).unwrap();
-        let mut bc = StringBuilder::new();
-        for i in 0..n_cells { bc.append_value(format!("C{i}")); }
-        let mut gd = StringBuilder::new();
-        for i in 0..n_guides { gd.append_value(format!("g{i}")); }
-        LoadedInput {
-            counts,
-            covariates: Covariates {
-                cell_barcodes: bc.finish(),
-                total_counts: Float32Array::from(totals.iter().map(|&t| t as f32).collect::<Vec<_>>()),
-            },
-            guide_metadata: GuideMetadata { guide_ids: gd.finish() },
-        }
+        input_with_totals(n_cells, n_guides, triples,
+            totals.iter().map(|&t| t as f32).collect())
     }
 
     fn is_unassigned(r: &AssignmentResult) -> &BooleanArray {

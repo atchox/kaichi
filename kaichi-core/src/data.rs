@@ -43,10 +43,53 @@ impl CountMatrix {
     }
 }
 
-/// Per-cell metadata: barcodes and guide-count totals.
+/// Categorical batch labels for a set of cells.
+///
+/// `codes[i]` is the batch index of cell `i`; `categories[k]` is the label of
+/// batch `k`. Same logical shape as Arrow `DictionaryArray<Int16, Utf8>` but
+/// kept as plain Vecs because the hot path is per-batch iteration and the
+/// Arrow dictionary API is awkward for that.
+pub struct BatchLabels {
+    pub codes: Vec<u16>,
+    pub categories: Vec<String>,
+}
+
+impl BatchLabels {
+    /// All cells in a single batch labeled "0". Used when the input h5ad has
+    /// no batch column — matches the design doc's "defaults to a single batch
+    /// if not provided".
+    pub fn single_batch(n_cells: usize) -> Self {
+        Self {
+            codes: vec![0u16; n_cells],
+            categories: vec!["0".to_string()],
+        }
+    }
+
+    pub fn n_batches(&self) -> usize {
+        self.categories.len()
+    }
+
+    pub fn n_cells(&self) -> usize {
+        self.codes.len()
+    }
+
+    /// Cell indices belonging to each batch. `result[b]` is the sorted list of
+    /// cell indices with code `b`. Built lazily by callers that need per-batch
+    /// iteration (e.g. beta2's per-batch fit).
+    pub fn cells_by_batch(&self) -> Vec<Vec<usize>> {
+        let mut out = vec![Vec::new(); self.n_batches()];
+        for (cell, &code) in self.codes.iter().enumerate() {
+            out[code as usize].push(cell);
+        }
+        out
+    }
+}
+
+/// Per-cell metadata: barcodes, guide-count totals, and batch labels.
 pub struct Covariates {
     pub cell_barcodes: StringArray,
     pub total_counts: Float32Array,
+    pub batch: BatchLabels,
 }
 
 /// Per-guide metadata: guide IDs and optional library annotations.
@@ -169,5 +212,44 @@ mod tests {
         // col index 5 is out of range for 2 guides
         let result = CountMatrix::try_from_csr(2, 2, vec![0, 1, 2], vec![0, 5], vec![1, 1]);
         assert!(result.is_err());
+    }
+
+    // ---- BatchLabels ----
+
+    #[test]
+    fn batch_labels_single_batch_assigns_all_to_zero() {
+        let b = BatchLabels::single_batch(5);
+        assert_eq!(b.codes, vec![0u16; 5]);
+        assert_eq!(b.categories, vec!["0".to_string()]);
+        assert_eq!(b.n_batches(), 1);
+        assert_eq!(b.n_cells(), 5);
+    }
+
+    #[test]
+    fn batch_labels_cells_by_batch_partitions_correctly() {
+        // 6 cells across 3 batches: [A, B, A, C, B, A]
+        let b = BatchLabels {
+            codes: vec![0, 1, 0, 2, 1, 0],
+            categories: vec!["A".into(), "B".into(), "C".into()],
+        };
+        let part = b.cells_by_batch();
+        assert_eq!(part.len(), 3);
+        assert_eq!(part[0], vec![0, 2, 5]); // cells with code 0
+        assert_eq!(part[1], vec![1, 4]);    // cells with code 1
+        assert_eq!(part[2], vec![3]);       // cells with code 2
+
+        // Partition is exhaustive and disjoint.
+        let mut all: Vec<usize> = part.iter().flatten().copied().collect();
+        all.sort();
+        assert_eq!(all, (0..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn batch_labels_empty() {
+        let b = BatchLabels::single_batch(0);
+        assert_eq!(b.codes, Vec::<u16>::new());
+        // single_batch always declares one category, even when no cells exist.
+        // That keeps n_batches() == 1 — a safe identity for downstream models.
+        assert_eq!(b.n_batches(), 1);
     }
 }

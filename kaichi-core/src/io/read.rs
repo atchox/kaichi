@@ -1,4 +1,4 @@
-use crate::data::{CountMatrix, Covariates, GuideMetadata, LoadedInput};
+use crate::data::{BatchLabels, CountMatrix, Covariates, GuideMetadata, LoadedInput};
 use anyhow::{bail, Context, Result};
 use arrow::array::StringBuilder;
 use hdf5::{types::VarLenUnicode, File};
@@ -43,16 +43,116 @@ pub fn read_h5ad(path: &Path) -> Result<LoadedInput> {
         guide_builder.append_value(s.as_str());
     }
 
+    let batch = read_batch_or_default(&file, n_cells)
+        .context("reading obs/batch")?;
+
     Ok(LoadedInput {
         counts,
         covariates: Covariates {
             cell_barcodes: barcode_builder.finish(),
             total_counts: arrow::array::Float32Array::from(total_counts_vec),
+            batch,
         },
         guide_metadata: GuideMetadata {
             guide_ids: guide_builder.finish(),
         },
     })
+}
+
+/// Read `obs/batch` if present; otherwise return a single-batch fallback.
+///
+/// AnnData stores categoricals as a group with `codes` (integer) and
+/// `categories` (string) datasets. We also handle the case where `obs/batch`
+/// is a plain string dataset (older fixtures sometimes write it that way).
+fn read_batch_or_default(file: &File, n_cells: usize) -> Result<BatchLabels> {
+    let obs = file.group("obs").context("missing /obs")?;
+    if !obs.link_exists("batch") {
+        return Ok(BatchLabels::single_batch(n_cells));
+    }
+
+    // Modern AnnData categorical: group with codes + categories children.
+    if let Ok(grp) = obs.group("batch") {
+        if grp.link_exists("codes") && grp.link_exists("categories") {
+            let codes_raw: Vec<i64> = read_int_dataset(&grp, "codes")
+                .context("reading obs/batch/codes")?;
+            let cats: Vec<VarLenUnicode> = grp
+                .dataset("categories")?
+                .read_raw::<VarLenUnicode>()
+                .context("reading obs/batch/categories")?;
+            let categories: Vec<String> = cats.into_iter().map(|s| s.to_string()).collect();
+            let n_cats = categories.len();
+            let mut codes = Vec::with_capacity(codes_raw.len());
+            for (i, c) in codes_raw.iter().enumerate() {
+                if *c < 0 {
+                    bail!(
+                        "obs/batch/codes[{i}] = {c}: AnnData uses negative codes for missing values; \
+                         kaichi cannot fit hierarchical models without a batch label for every cell"
+                    );
+                }
+                if *c >= u16::MAX as i64 {
+                    bail!(
+                        "obs/batch/codes[{i}] = {c}: too many batches (kaichi supports up to {} \
+                         distinct batches per dataset)", u16::MAX
+                    );
+                }
+                if (*c as usize) >= n_cats {
+                    bail!(
+                        "obs/batch/codes[{i}] = {c}: code out of range \
+                         for {n_cats} declared categories"
+                    );
+                }
+                codes.push(*c as u16);
+            }
+            return Ok(BatchLabels { codes, categories });
+        }
+    }
+
+    // Fallback: obs/batch is a plain string dataset.
+    if let Ok(ds) = obs.dataset("batch") {
+        if let Ok(raw) = ds.read_raw::<VarLenUnicode>() {
+            let labels: Vec<String> = raw.into_iter().map(|s| s.to_string()).collect();
+            return Ok(build_categorical(labels));
+        }
+    }
+
+    // Couldn't decode any known form — fall back to single batch rather than fail.
+    Ok(BatchLabels::single_batch(n_cells))
+}
+
+/// Read an integer dataset, trying common dtypes. Returns i64 so any input
+/// dtype can be widened losslessly.
+fn read_int_dataset(grp: &hdf5::Group, name: &str) -> Result<Vec<i64>> {
+    let ds = grp.dataset(name)?;
+    if let Ok(v) = ds.read_raw::<i64>() { return Ok(v); }
+    if let Ok(v) = ds.read_raw::<i32>() { return Ok(v.into_iter().map(|x| x as i64).collect()); }
+    if let Ok(v) = ds.read_raw::<i16>() { return Ok(v.into_iter().map(|x| x as i64).collect()); }
+    if let Ok(v) = ds.read_raw::<i8>()  { return Ok(v.into_iter().map(|x| x as i64).collect()); }
+    if let Ok(v) = ds.read_raw::<u32>() { return Ok(v.into_iter().map(|x| x as i64).collect()); }
+    if let Ok(v) = ds.read_raw::<u16>() { return Ok(v.into_iter().map(|x| x as i64).collect()); }
+    if let Ok(v) = ds.read_raw::<u8>()  { return Ok(v.into_iter().map(|x| x as i64).collect()); }
+    bail!("dataset {name}: unsupported integer dtype")
+}
+
+/// Build a `BatchLabels` from a per-cell vector of string labels by
+/// constructing the category list in first-appearance order.
+fn build_categorical(labels: Vec<String>) -> BatchLabels {
+    use std::collections::HashMap;
+    let mut categories: Vec<String> = Vec::new();
+    let mut index: HashMap<String, u16> = HashMap::new();
+    let mut codes: Vec<u16> = Vec::with_capacity(labels.len());
+    for s in labels {
+        let code = match index.get(&s) {
+            Some(&k) => k,
+            None => {
+                let k = categories.len() as u16;
+                categories.push(s.clone());
+                index.insert(s, k);
+                k
+            }
+        };
+        codes.push(code);
+    }
+    BatchLabels { codes, categories }
 }
 
 /// Read the index column from a dataframe group (obs or var).
@@ -377,6 +477,253 @@ mod tests {
     fn read_h5ad_missing_file_returns_err() {
         let result = read_h5ad(std::path::Path::new("/nonexistent/path.h5ad"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_h5ad_defaults_to_single_batch_when_obs_batch_absent() {
+        // make_test_input doesn't write obs/batch — reader should fall back to single batch.
+        let tmp = make_test_input();
+        let loaded = read_h5ad(tmp.path()).unwrap();
+        let b = &loaded.covariates.batch;
+        assert_eq!(b.n_batches(), 1);
+        assert_eq!(b.codes, vec![0u16; 3]);
+        assert_eq!(b.categories, vec!["0".to_string()]);
+    }
+
+    #[test]
+    fn read_h5ad_reads_categorical_batch() {
+        // Modern AnnData layout: obs/batch is a group with codes + categories children.
+        let tmp = tmp_h5ad();
+        use hdf5::{types::VarLenUnicode, File};
+        use ndarray::Array1;
+        use std::str::FromStr;
+        {
+            let file = File::create(tmp.path()).unwrap();
+            let vlu = |s: &str| VarLenUnicode::from_str(s).unwrap();
+            let scalar = |loc: &hdf5::Location, name: &str, val: &str| {
+                let arr = ndarray::arr0(vlu(val));
+                loc.new_attr_builder().with_data(&arr).create(name).unwrap();
+            };
+            let empty: Array1<f64> = Array1::zeros(0);
+
+            scalar(&file, "encoding-type", "anndata");
+            scalar(&file, "encoding-version", "0.1.0");
+
+            let obs = file.create_group("obs").unwrap();
+            scalar(&obs, "encoding-type", "dataframe");
+            scalar(&obs, "encoding-version", "0.2.0");
+            scalar(&obs, "_index", "_index");
+            obs.new_attr_builder().with_data(&empty).create("column-order").unwrap();
+            let bcs: Array1<VarLenUnicode> = ["C1", "C2", "C3", "C4"].iter().map(|s| vlu(s)).collect();
+            obs.new_dataset_builder().with_data(&bcs).create("_index").unwrap();
+
+            // obs/batch as categorical group: codes [0, 1, 0, 1], categories ["A", "B"].
+            let batch_grp = obs.create_group("batch").unwrap();
+            scalar(&batch_grp, "encoding-type", "categorical");
+            scalar(&batch_grp, "encoding-version", "0.2.0");
+            let codes_arr: Array1<i32> = Array1::from_vec(vec![0, 1, 0, 1]);
+            batch_grp.new_dataset_builder().with_data(&codes_arr).create("codes").unwrap();
+            let cats: Array1<VarLenUnicode> = ["A", "B"].iter().map(|s| vlu(s)).collect();
+            batch_grp.new_dataset_builder().with_data(&cats).create("categories").unwrap();
+
+            let var = file.create_group("var").unwrap();
+            scalar(&var, "encoding-type", "dataframe");
+            scalar(&var, "encoding-version", "0.2.0");
+            scalar(&var, "_index", "_index");
+            var.new_attr_builder().with_data(&empty).create("column-order").unwrap();
+            let guides: Array1<VarLenUnicode> = ["gA"].iter().map(|s| vlu(s)).collect();
+            var.new_dataset_builder().with_data(&guides).create("_index").unwrap();
+
+            let x_grp = file.create_group("X").unwrap();
+            scalar(&x_grp, "encoding-type", "csr_matrix");
+            scalar(&x_grp, "encoding-version", "0.1.0");
+            let shape = ndarray::arr1(&[4i64, 1i64]);
+            x_grp.new_attr_builder().with_data(&shape).create("shape").unwrap();
+            let data: Array1<i64> = Array1::from_vec(vec![1, 1, 1, 1]);
+            let idxs: Array1<i32> = Array1::from_vec(vec![0, 0, 0, 0]);
+            let iptr: Array1<i32> = Array1::from_vec(vec![0, 1, 2, 3, 4]);
+            x_grp.new_dataset_builder().with_data(&data).create("data").unwrap();
+            x_grp.new_dataset_builder().with_data(&idxs).create("indices").unwrap();
+            x_grp.new_dataset_builder().with_data(&iptr).create("indptr").unwrap();
+        }
+
+        let loaded = read_h5ad(tmp.path()).unwrap();
+        let b = &loaded.covariates.batch;
+        assert_eq!(b.codes, vec![0u16, 1, 0, 1]);
+        assert_eq!(b.categories, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(b.n_batches(), 2);
+    }
+
+    #[test]
+    fn read_h5ad_reads_plain_string_batch() {
+        // Older fixtures: obs/batch is a plain string dataset.
+        let tmp = tmp_h5ad();
+        use hdf5::{types::VarLenUnicode, File};
+        use ndarray::Array1;
+        use std::str::FromStr;
+        {
+            let file = File::create(tmp.path()).unwrap();
+            let vlu = |s: &str| VarLenUnicode::from_str(s).unwrap();
+            let scalar = |loc: &hdf5::Location, name: &str, val: &str| {
+                let arr = ndarray::arr0(vlu(val));
+                loc.new_attr_builder().with_data(&arr).create(name).unwrap();
+            };
+            let empty: Array1<f64> = Array1::zeros(0);
+
+            scalar(&file, "encoding-type", "anndata");
+            scalar(&file, "encoding-version", "0.1.0");
+
+            let obs = file.create_group("obs").unwrap();
+            scalar(&obs, "encoding-type", "dataframe");
+            scalar(&obs, "encoding-version", "0.2.0");
+            scalar(&obs, "_index", "_index");
+            obs.new_attr_builder().with_data(&empty).create("column-order").unwrap();
+            let bcs: Array1<VarLenUnicode> = ["C1", "C2", "C3"].iter().map(|s| vlu(s)).collect();
+            obs.new_dataset_builder().with_data(&bcs).create("_index").unwrap();
+
+            // obs/batch as a plain string dataset: ["X", "Y", "X"].
+            let batches: Array1<VarLenUnicode> = ["X", "Y", "X"].iter().map(|s| vlu(s)).collect();
+            obs.new_dataset_builder().with_data(&batches).create("batch").unwrap();
+
+            let var = file.create_group("var").unwrap();
+            scalar(&var, "encoding-type", "dataframe");
+            scalar(&var, "encoding-version", "0.2.0");
+            scalar(&var, "_index", "_index");
+            var.new_attr_builder().with_data(&empty).create("column-order").unwrap();
+            let guides: Array1<VarLenUnicode> = ["gA"].iter().map(|s| vlu(s)).collect();
+            var.new_dataset_builder().with_data(&guides).create("_index").unwrap();
+
+            let x_grp = file.create_group("X").unwrap();
+            scalar(&x_grp, "encoding-type", "csr_matrix");
+            scalar(&x_grp, "encoding-version", "0.1.0");
+            let shape = ndarray::arr1(&[3i64, 1i64]);
+            x_grp.new_attr_builder().with_data(&shape).create("shape").unwrap();
+            let data: Array1<i64> = Array1::from_vec(vec![1, 1, 1]);
+            let idxs: Array1<i32> = Array1::from_vec(vec![0, 0, 0]);
+            let iptr: Array1<i32> = Array1::from_vec(vec![0, 1, 2, 3]);
+            x_grp.new_dataset_builder().with_data(&data).create("data").unwrap();
+            x_grp.new_dataset_builder().with_data(&idxs).create("indices").unwrap();
+            x_grp.new_dataset_builder().with_data(&iptr).create("indptr").unwrap();
+        }
+
+        let loaded = read_h5ad(tmp.path()).unwrap();
+        let b = &loaded.covariates.batch;
+        // First-appearance order: X gets code 0, Y gets code 1.
+        assert_eq!(b.codes, vec![0u16, 1, 0]);
+        assert_eq!(b.categories, vec!["X".to_string(), "Y".to_string()]);
+    }
+
+    /// Write a minimal h5ad with an obs/batch categorical group built from caller-supplied
+    /// codes and categories. Codes can be written as any integer dtype the caller chooses
+    /// — pass a fn that builds the codes dataset under the batch group.
+    fn write_h5ad_with_batch_codes<F>(
+        path: &std::path::Path,
+        n_cells: usize,
+        categories: &[&str],
+        write_codes: F,
+    ) where F: FnOnce(&hdf5::Group) {
+        use hdf5::{types::VarLenUnicode, File};
+        use ndarray::Array1;
+        use std::str::FromStr;
+
+        let file = File::create(path).unwrap();
+        let vlu = |s: &str| VarLenUnicode::from_str(s).unwrap();
+        let scalar = |loc: &hdf5::Location, name: &str, val: &str| {
+            let arr = ndarray::arr0(vlu(val));
+            loc.new_attr_builder().with_data(&arr).create(name).unwrap();
+        };
+        let empty: Array1<f64> = Array1::zeros(0);
+
+        scalar(&file, "encoding-type", "anndata");
+        scalar(&file, "encoding-version", "0.1.0");
+
+        let obs = file.create_group("obs").unwrap();
+        scalar(&obs, "encoding-type", "dataframe");
+        scalar(&obs, "encoding-version", "0.2.0");
+        scalar(&obs, "_index", "_index");
+        obs.new_attr_builder().with_data(&empty).create("column-order").unwrap();
+        let bcs: Array1<VarLenUnicode> =
+            (0..n_cells).map(|i| vlu(&format!("C{i}"))).collect();
+        obs.new_dataset_builder().with_data(&bcs).create("_index").unwrap();
+
+        let batch_grp = obs.create_group("batch").unwrap();
+        scalar(&batch_grp, "encoding-type", "categorical");
+        scalar(&batch_grp, "encoding-version", "0.2.0");
+        let cats: Array1<VarLenUnicode> = categories.iter().map(|s| vlu(s)).collect();
+        batch_grp
+            .new_dataset_builder()
+            .with_data(&cats)
+            .create("categories")
+            .unwrap();
+        write_codes(&batch_grp);
+
+        let var = file.create_group("var").unwrap();
+        scalar(&var, "encoding-type", "dataframe");
+        scalar(&var, "encoding-version", "0.2.0");
+        scalar(&var, "_index", "_index");
+        var.new_attr_builder().with_data(&empty).create("column-order").unwrap();
+        let guides: Array1<VarLenUnicode> = ["gA"].iter().map(|s| vlu(s)).collect();
+        var.new_dataset_builder().with_data(&guides).create("_index").unwrap();
+
+        let x_grp = file.create_group("X").unwrap();
+        scalar(&x_grp, "encoding-type", "csr_matrix");
+        scalar(&x_grp, "encoding-version", "0.1.0");
+        let shape = ndarray::arr1(&[n_cells as i64, 1i64]);
+        x_grp.new_attr_builder().with_data(&shape).create("shape").unwrap();
+        let data: Array1<i64> = Array1::from_vec(vec![1; n_cells]);
+        let idxs: Array1<i32> = Array1::from_vec(vec![0; n_cells]);
+        let iptr: Array1<i32> = (0..=n_cells as i32).collect();
+        x_grp.new_dataset_builder().with_data(&data).create("data").unwrap();
+        x_grp.new_dataset_builder().with_data(&idxs).create("indices").unwrap();
+        x_grp.new_dataset_builder().with_data(&iptr).create("indptr").unwrap();
+    }
+
+    #[test]
+    fn read_h5ad_batch_codes_accept_int8_dtype() {
+        // Verifies the i8 branch of `read_int_dataset` — AnnData often stores codes as i8
+        // when the number of categories is small.
+        let tmp = tmp_h5ad();
+        write_h5ad_with_batch_codes(tmp.path(), 3, &["A", "B"], |grp| {
+            let codes = ndarray::Array1::from_vec(vec![0i8, 1, 0]);
+            grp.new_dataset_builder().with_data(&codes).create("codes").unwrap();
+        });
+        let loaded = read_h5ad(tmp.path()).unwrap();
+        assert_eq!(loaded.covariates.batch.codes, vec![0u16, 1, 0]);
+        assert_eq!(loaded.covariates.batch.categories, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn read_h5ad_rejects_negative_batch_code() {
+        // AnnData uses code = −1 for missing/NA. We reject it loudly rather than silently
+        // routing those cells into batch 0.
+        let tmp = tmp_h5ad();
+        write_h5ad_with_batch_codes(tmp.path(), 3, &["A", "B"], |grp| {
+            let codes = ndarray::Array1::from_vec(vec![0i32, -1, 1]);
+            grp.new_dataset_builder().with_data(&codes).create("codes").unwrap();
+        });
+        let result = read_h5ad(tmp.path());
+        let err = match result {
+            Ok(_) => panic!("expected error for negative batch code, got Ok"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("negative codes") || err.contains("missing"),
+                "expected 'negative codes' / 'missing' in error, got: {err}");
+    }
+
+    #[test]
+    fn read_h5ad_rejects_out_of_range_batch_code() {
+        // A code that exceeds n_categories must fail rather than panic later at gamma[code].
+        let tmp = tmp_h5ad();
+        write_h5ad_with_batch_codes(tmp.path(), 3, &["A", "B"], |grp| {
+            let codes = ndarray::Array1::from_vec(vec![0i32, 1, 5]); // 5 ≥ 2 categories
+            grp.new_dataset_builder().with_data(&codes).create("codes").unwrap();
+        });
+        let result = read_h5ad(tmp.path());
+        let err = match result {
+            Ok(_) => panic!("expected error for out-of-range batch code, got Ok"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("out of range"), "expected 'out of range', got: {err}");
     }
 
     #[test]
