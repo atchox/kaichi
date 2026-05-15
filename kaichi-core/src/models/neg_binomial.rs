@@ -1,5 +1,5 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_nb_pmf, logsumexp2, run_em, solve_2x2_sym};
+use super::em::{clamp_probability, log_nb_pmf, logsumexp2, run_em};
 use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
 
@@ -41,12 +41,14 @@ impl Default for NegBinomialModel {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct FitParams {
     pi: f64,
     beta0: f64,
     beta1: f64,
     log_theta: f64,
+    /// Per-batch log-rate offset; `gamma[0]` is anchored at 0 for identifiability.
+    gamma: Vec<f64>,
 }
 
 impl AssignmentModel for NegBinomialModel {
@@ -59,6 +61,8 @@ impl AssignmentModel for NegBinomialModel {
         let n_guides = input.counts.n_guides;
         let csc = input.counts.csc();
         let total_counts = &input.covariates.total_counts;
+        let batch = &input.covariates.batch;
+        let n_batches = batch.n_batches();
 
         let log_depths: Vec<f64> = (0..n_cells)
             .map(|i| (total_counts.value(i) as f64 + 1.0).ln())
@@ -71,14 +75,14 @@ impl AssignmentModel for NegBinomialModel {
             .into_par_iter()
             .map(|g| {
                 let col = csc.get_col(g).unwrap();
-                let data: Vec<(f64, f64)> = col
+                let data: Vec<(f64, f64, u16)> = col
                     .row_indices()
                     .iter()
                     .zip(col.values())
                     .filter(|(_, &v)| v > 0)
-                    .map(|(&i, &v)| (v as f64, log_depths[i]))
+                    .map(|(&i, &v)| (v as f64, log_depths[i], batch.codes[i]))
                     .collect();
-                self.fit_guide(&data, theta_log_min, theta_log_max)
+                self.fit_guide(&data, n_batches, theta_log_min, theta_log_max)
             })
             .collect();
 
@@ -89,13 +93,17 @@ impl AssignmentModel for NegBinomialModel {
 
         for cell in 0..n_cells {
             let log_d = log_depths[cell];
+            let b = batch.codes[cell] as usize;
             let row = csr.get_row(cell).unwrap();
             let mut best: Option<(usize, f32, u32)> = None;
             let mut n_passing: usize = 0;
 
             for (&guide_idx, &count) in row.col_indices().iter().zip(row.values()) {
-                let Some(params) = guide_fits[guide_idx] else { continue };
-                let post = posterior_signal(count as f64, log_d, params) as f32;
+                let params = match &guide_fits[guide_idx] {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let post = posterior_signal(count as f64, log_d, params, b) as f32;
                 if post >= self.min_confidence {
                     n_passing += 1;
                     match best {
@@ -144,14 +152,15 @@ impl AssignmentModel for NegBinomialModel {
 }
 
 impl NegBinomialModel {
-    fn fit_guide(&self, data: &[(f64, f64)], theta_log_min: f64, theta_log_max: f64) -> Option<FitParams> {
+    fn fit_guide(&self, data: &[(f64, f64, u16)], n_batches: usize, theta_log_min: f64, theta_log_max: f64) -> Option<FitParams> {
         let n_nonzero = data.len() as u32;
-        let max_count = data.iter().map(|(y, _)| *y as u32).max().unwrap_or(0);
+        let max_count = data.iter().map(|(y, _, _)| *y as u32).max().unwrap_or(0);
         if n_nonzero < self.min_nonzero || max_count < self.min_max_count {
             return None;
         }
         Some(fit_mixture(
             data,
+            n_batches,
             self.max_em_iters,
             self.inner_max_iters,
             self.tol as f64,
@@ -167,7 +176,8 @@ impl NegBinomialModel {
 // ---------------------------------------------------------------------------
 
 fn fit_mixture(
-    data: &[(f64, f64)],
+    data: &[(f64, f64, u16)],
+    n_batches: usize,
     max_em_iters: u32,
     inner_max_iters: u32,
     tol: f64,
@@ -175,7 +185,7 @@ fn fit_mixture(
     log_theta_min: f64,
     log_theta_max: f64,
 ) -> FitParams {
-    let init = initialize_params(data, log_theta_init);
+    let init = initialize_params(data, n_batches, log_theta_init);
     let mut responsibilities = vec![0.0f64; data.len()];
 
     run_em(
@@ -183,9 +193,10 @@ fn fit_mixture(
         |params| {
             let theta = params.log_theta.exp();
             let mut log_lik = 0.0;
-            for (idx, &(y, log_d)) in data.iter().enumerate() {
-                let mu0 = (params.beta0 + log_d).exp();
-                let mu1 = (params.beta0 + params.beta1 + log_d).exp();
+            for (idx, &(y, log_d, b)) in data.iter().enumerate() {
+                let gb = params.gamma[b as usize];
+                let mu0 = (params.beta0 + gb + log_d).exp();
+                let mu1 = (params.beta0 + params.beta1 + gb + log_d).exp();
                 let log_bg = (1.0 - params.pi).ln() + log_nb_pmf(y, mu0, theta);
                 let log_sig = params.pi.ln() + log_nb_pmf(y, mu1, theta);
                 let denom = logsumexp2(log_bg, log_sig);
@@ -203,73 +214,123 @@ fn fit_mixture(
     )
 }
 
-fn initialize_params(data: &[(f64, f64)], log_theta_init: f64) -> FitParams {
-    let max_y: f64 = data.iter().map(|(y, _)| *y).fold(f64::NEG_INFINITY, f64::max);
-    let mean_depth: f64 = data.iter().map(|(_, d)| d.exp()).sum::<f64>() / data.len() as f64;
-    let mut sorted_y: Vec<f64> = data.iter().map(|(y, _)| *y).collect();
-    sorted_y.sort_by(f64::total_cmp);
-    // Use median as robust background-mean estimate (NB has fat tails; mean is pulled up by signal).
-    let median_y = sorted_y[sorted_y.len() / 2].max(1.0);
-    let beta0 = (median_y / mean_depth.max(1e-6)).ln().clamp(-10.0, 10.0);
-    let beta1 = (max_y / median_y).ln().max(0.1);
-    FitParams { pi: 0.1, beta0, beta1, log_theta: log_theta_init }
+fn initialize_params(data: &[(f64, f64, u16)], n_batches: usize, log_theta_init: f64) -> FitParams {
+    let max_y: f64 = data.iter().map(|(y, _, _)| *y).fold(f64::NEG_INFINITY, f64::max);
+    let mean_depth: f64 = data.iter().map(|(_, d, _)| d.exp()).sum::<f64>() / data.len() as f64;
+
+    // Per-batch median y → per-batch baseline init. Without this, a global median over
+    // heterogeneous batches puts the EM in the wrong basin.
+    let mut per_batch_y: Vec<Vec<f64>> = vec![Vec::new(); n_batches];
+    for &(y, _, b) in data {
+        if (b as usize) < n_batches {
+            per_batch_y[b as usize].push(y);
+        }
+    }
+    let per_batch_median: Vec<f64> = per_batch_y
+        .iter_mut()
+        .map(|ys| {
+            if ys.is_empty() {
+                1.0
+            } else {
+                ys.sort_by(f64::total_cmp);
+                ys[ys.len() / 2].max(1.0)
+            }
+        })
+        .collect();
+
+    let m0 = per_batch_median[0];
+    let beta0 = (m0 / mean_depth.max(1e-6)).ln().clamp(-10.0, 10.0);
+    let mut gamma = vec![0.0; n_batches];
+    for b in 1..n_batches {
+        gamma[b] = (per_batch_median[b] / m0).ln().clamp(-5.0, 5.0);
+    }
+
+    let mut all_y: Vec<f64> = data.iter().map(|(y, _, _)| *y).collect();
+    all_y.sort_by(f64::total_cmp);
+    let global_median = all_y[all_y.len() / 2].max(1.0);
+    let beta1 = (max_y / global_median).ln().max(0.1);
+
+    FitParams { pi: 0.1, beta0, beta1, log_theta: log_theta_init, gamma }
 }
 
 fn m_step(
     params: FitParams,
-    data: &[(f64, f64)],
+    data: &[(f64, f64, u16)],
     resp: &[f64],
     inner_max_iters: u32,
     log_theta_min: f64,
     log_theta_max: f64,
 ) -> FitParams {
     let pi = clamp_probability(resp.iter().sum::<f64>() / data.len() as f64);
-    let mut beta0 = params.beta0;
+    let n_batches = params.gamma.len();
+
+    // Same arrow-Hessian Schur strategy as Poisson, but with NB's score (θ(y−μ)/(μ+θ))
+    // and Fisher info (μθ/(μ+θ)). η_b = β0 + γ_b carries the per-batch baseline.
+    let mut eta: Vec<f64> = (0..n_batches)
+        .map(|b| params.beta0 + params.gamma[b])
+        .collect();
     let mut beta1 = params.beta1;
     let mut log_theta = params.log_theta;
 
     for _ in 0..inner_max_iters {
         let theta = log_theta.exp();
 
-        // Newton step for (β0, β1) using NB Fisher information.
-        let mut g = [0.0f64; 2];
-        let mut fi = [0.0f64; 3];
-        for (&(y, log_d), &r) in data.iter().zip(resp) {
-            let mu0 = (beta0 + log_d).exp();
-            let mu1 = (beta0 + beta1 + log_d).exp();
-            // Score function ∂log_nb/∂μ = y/μ - (y+θ)/(μ+θ). Multiply by μ for β0/β1.
-            let s0 = y - mu0 * (y + theta) / (mu0 + theta);
-            let s1 = y - mu1 * (y + theta) / (mu1 + theta);
-            g[0] += (1.0 - r) * s0 + r * s1;
-            g[1] += r * s1;
-            // Fisher information: μ·θ/(μ+θ) per GLM IRLS weight.
+        // (η_0, ..., η_{B−1}, β1) Schur step with NB weights, holding θ fixed.
+        let mut g_eta = vec![0.0f64; n_batches];
+        let mut d = vec![0.0f64; n_batches];
+        let mut c = vec![0.0f64; n_batches];
+        let mut g_beta1 = 0.0f64;
+        let mut s = 0.0f64;
+
+        for (&(y, log_d, bi), &r) in data.iter().zip(resp) {
+            let b = bi as usize;
+            let mu0 = (eta[b] + log_d).exp();
+            let mu1 = (eta[b] + beta1 + log_d).exp();
+            let s0 = theta * (y - mu0) / (mu0 + theta);
+            let s1 = theta * (y - mu1) / (mu1 + theta);
+            g_eta[b] += (1.0 - r) * s0 + r * s1;
+            g_beta1 += r * s1;
             let w0 = mu0 * theta / (mu0 + theta);
             let w1 = mu1 * theta / (mu1 + theta);
-            fi[0] += (1.0 - r) * w0 + r * w1;
-            fi[1] += r * w1;
-            fi[2] += r * w1;
-        }
-        if let Some(delta) = solve_2x2_sym(fi, g) {
-            beta0 += delta[0].clamp(-3.0, 3.0);
-            beta1 += delta[1].clamp(-3.0, 3.0);
+            d[b] += (1.0 - r) * w0 + r * w1;
+            c[b] += r * w1;
+            s += r * w1;
         }
 
-        // 1D Newton step for log_θ.
+        let mut schur = s;
+        let mut g_schur = g_beta1;
+        for b in 0..n_batches {
+            if d[b] > 1e-14 {
+                schur -= c[b] * c[b] / d[b];
+                g_schur -= c[b] * g_eta[b] / d[b];
+            }
+        }
+        let d_beta1 = if schur.abs() > 1e-14 {
+            (g_schur / schur).clamp(-3.0, 3.0)
+        } else { 0.0 };
+
+        for b in 0..n_batches {
+            let d_eta = if d[b] > 1e-14 {
+                ((g_eta[b] - c[b] * d_beta1) / d[b]).clamp(-3.0, 3.0)
+            } else { 0.0 };
+            eta[b] += d_eta;
+        }
+        beta1 += d_beta1;
+
+        // 1D Newton step for log_θ (holding η and β1 fixed). NB-specific digamma/trigamma math.
         let theta = log_theta.exp();
         let mut grad_phi = 0.0;
         let mut hess_phi = 0.0;
-        for (&(y, log_d), &r) in data.iter().zip(resp) {
-            let mu0 = (beta0 + log_d).exp();
-            let mu1 = (beta0 + beta1 + log_d).exp();
+        for (&(y, log_d, bi), &r) in data.iter().zip(resp) {
+            let b = bi as usize;
+            let mu0 = (eta[b] + log_d).exp();
+            let mu1 = (eta[b] + beta1 + log_d).exp();
             for (mu, w) in [(mu0, 1.0 - r), (mu1, r)] {
-                // ∂log_nb/∂θ
                 let g_theta = digamma(y + theta) - digamma(theta)
                     + (theta / (theta + mu)).ln() + 1.0 - (theta + y) / (theta + mu);
-                // ∂²log_nb/∂θ²
                 let h_theta = trigamma(y + theta) - trigamma(theta)
                     + mu / (theta * (theta + mu))
                     + (y - mu) / (theta + mu).powi(2);
-                // Chain rule for φ = log_θ: ∂f/∂φ = θ·∂f/∂θ, ∂²f/∂φ² = θ·∂f/∂θ + θ²·∂²f/∂θ²
                 grad_phi += w * theta * g_theta;
                 hess_phi += w * (theta * g_theta + theta * theta * h_theta);
             }
@@ -280,15 +341,27 @@ fn m_step(
         }
     }
 
-    if beta1 < 0.0 { beta1 = -beta1; }
+    let beta0 = eta[0];
+    let mut gamma = vec![0.0; n_batches];
+    for b in 1..n_batches {
+        gamma[b] = eta[b] - eta[0];
+    }
 
-    FitParams { pi, beta0, beta1, log_theta }
+    // Same identifiability relabel as Poisson; see comment there.
+    let (pi, beta0, beta1) = if beta1 < 0.0 {
+        (1.0 - pi, beta0 + beta1, -beta1)
+    } else {
+        (pi, beta0, beta1)
+    };
+
+    FitParams { pi, beta0, beta1, log_theta, gamma }
 }
 
-fn posterior_signal(y: f64, log_d: f64, params: FitParams) -> f64 {
+fn posterior_signal(y: f64, log_d: f64, params: &FitParams, batch_idx: usize) -> f64 {
     let theta = params.log_theta.exp();
-    let mu0 = (params.beta0 + log_d).exp();
-    let mu1 = (params.beta0 + params.beta1 + log_d).exp();
+    let gb = params.gamma[batch_idx];
+    let mu0 = (params.beta0 + gb + log_d).exp();
+    let mu1 = (params.beta0 + params.beta1 + gb + log_d).exp();
     let log_bg = (1.0 - params.pi).ln() + log_nb_pmf(y, mu0, theta);
     let log_sig = params.pi.ln() + log_nb_pmf(y, mu1, theta);
     let denom = logsumexp2(log_bg, log_sig);
@@ -406,12 +479,16 @@ mod tests {
 
     // ---- posterior_signal (NB Bayes) ----
 
+    fn fp(pi: f64, beta0: f64, beta1: f64, log_theta: f64) -> FitParams {
+        FitParams { pi, beta0, beta1, log_theta, gamma: vec![0.0] }
+    }
+
     #[test]
     fn nb_posterior_equals_pi_when_components_identical() {
         // β1 = 0 ⇒ μ_signal = μ_bg ⇒ likelihoods identical ⇒ posterior = π.
         for &pi in &[0.05, 0.3, 0.5, 0.8, 0.95] {
-            let p = FitParams { pi, beta0: -1.0, beta1: 0.0, log_theta: 1.0 };
-            let post = posterior_signal(3.0, 2.0, p);
+            let p = fp(pi, -1.0, 0.0, 1.0);
+            let post = posterior_signal(3.0, 2.0, &p, 0);
             assert!((post - pi).abs() < 1e-12, "π={pi}: got {post}");
         }
     }
@@ -419,12 +496,11 @@ mod tests {
     #[test]
     fn nb_posterior_monotonic_in_y_when_beta1_positive() {
         // With β1 > 0 (signal mean > background mean), bigger y favors signal.
-        let p = FitParams { pi: 0.3, beta0: -1.5, beta1: 2.0, log_theta: 1.0 };
+        let p = fp(0.3, -1.5, 2.0, 1.0);
         let log_d = (50.0_f64 + 1.0).ln();
-        let ys = [0.0, 1.0, 3.0, 8.0, 20.0, 50.0];
         let mut prev = -1.0;
-        for y in ys {
-            let post = posterior_signal(y, log_d, p);
+        for y in [0.0, 1.0, 3.0, 8.0, 20.0, 50.0] {
+            let post = posterior_signal(y, log_d, &p, 0);
             assert!(post > prev, "non-monotonic at y={y}: prev={prev}, post={post}");
             prev = post;
         }
@@ -432,25 +508,32 @@ mod tests {
 
     #[test]
     fn nb_posterior_saturates_at_very_large_y() {
-        // y much greater than μ_bg, smaller than μ_sig: posterior near 1.
-        let p = FitParams { pi: 0.2, beta0: 0.0, beta1: 3.0, log_theta: 5.0 };
-        // log_d = 0 so μ_bg = e⁰ = 1, μ_sig = e³ ≈ 20.
-        assert!(posterior_signal(50.0, 0.0, p) > 0.99);
-        // At y=0, well within the background range → posterior < π.
-        assert!(posterior_signal(0.0, 0.0, p) < 0.2);
+        let p = fp(0.2, 0.0, 3.0, 5.0);
+        assert!(posterior_signal(50.0, 0.0, &p, 0) > 0.99);
+        assert!(posterior_signal(0.0, 0.0, &p, 0) < 0.2);
+    }
+
+    #[test]
+    fn nb_posterior_uses_batch_gamma() {
+        // γ_1 > 0 raises batch 1's baseline → the same y at log_d=0 looks more like
+        // background in batch 1 than in batch 0.
+        let p = FitParams { pi: 0.3, beta0: -2.0, beta1: 2.0, log_theta: 1.0, gamma: vec![0.0, 1.5] };
+        let b0 = posterior_signal(5.0, 0.0, &p, 0);
+        let b1 = posterior_signal(5.0, 0.0, &p, 1);
+        assert!(b0 > b1, "γ_1 > 0 should suppress signal in batch 1: b0={b0}, b1={b1}");
     }
 
     // ---- fit_mixture: synthetic recovery ----
 
     #[test]
     fn fit_mixture_recovers_bimodal_nb() {
-        // 15 background counts 0–2, 10 signal counts 18–27. All cells at depth 50.
+        // 15 background counts 0–2, 10 signal counts 18–27. All cells at depth 50, single batch.
         let log_d = (50.0_f64 + 1.0).ln();
-        let mut data: Vec<(f64, f64)> = (0..15).map(|i| ((i % 3) as f64, log_d)).collect();
-        data.extend((0..10).map(|i| (18.0 + i as f64, log_d)));
+        let mut data: Vec<(f64, f64, u16)> = (0..15).map(|i| ((i % 3) as f64, log_d, 0u16)).collect();
+        data.extend((0..10).map(|i| (18.0 + i as f64, log_d, 0u16)));
 
         let fitted = fit_mixture(
-            &data, 200, 25, 1e-8,
+            &data, 1, 200, 25, 1e-8,
             5.0_f64.ln(), 0.01_f64.ln(), 1e4_f64.ln(),
         );
 
@@ -460,25 +543,45 @@ mod tests {
         assert!(mu_sig > mu_bg, "μ_sig={mu_sig} should exceed μ_bg={mu_bg}");
         assert!(mu_bg < 5.0, "μ_bg should track the low cluster, got {mu_bg}");
         assert!(mu_sig > 15.0, "μ_sig should track the high cluster, got {mu_sig}");
-        // ~10/25 = 0.4 signal weight; allow slack since EM can drift.
         assert!((0.2..=0.6).contains(&fitted.pi), "pi drifted: {}", fitted.pi);
+        assert_eq!(fitted.gamma, vec![0.0]);
     }
 
     #[test]
     fn fit_mixture_respects_theta_clamp() {
-        // log_theta_max bounds θ from above. If the data is exactly Poisson (θ → ∞),
-        // log_theta must stop at log_theta_max instead of running off.
         let log_d = (100.0_f64 + 1.0).ln();
-        // Counts with no overdispersion (handcrafted, all near means).
-        let data: Vec<(f64, f64)> = (0..15)
+        let data: Vec<(f64, f64, u16)> = (0..15)
             .map(|i| if i < 10 { 1.0 } else { 20.0 })
-            .map(|y| (y, log_d))
+            .map(|y| (y, log_d, 0u16))
             .collect();
-        let cap_log = 3.0; // ln(20) ≈ 3.0
-        let fitted = fit_mixture(&data, 200, 25, 1e-8, 1.0, -4.0, cap_log);
+        let cap_log = 3.0;
+        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8, 1.0, -4.0, cap_log);
         assert!(
             fitted.log_theta <= cap_log + 1e-9,
             "log_theta {} exceeded cap {cap_log}", fitted.log_theta
+        );
+    }
+
+    #[test]
+    fn fit_mixture_recovers_batch_offsets() {
+        // Two batches with same signal/background shape but 4× baselines.
+        // γ_1 should land near ln(4) ≈ 1.39.
+        let log_d = (50.0_f64 + 1.0).ln();
+        let mut data: Vec<(f64, f64, u16)> = Vec::new();
+        for i in 0..10 { data.push(((i % 2 + 1) as f64, log_d, 0u16)); }
+        for i in 0..6  { data.push((18.0 + i as f64, log_d, 0u16)); }
+        for i in 0..10 { data.push(((i % 2 + 4) as f64, log_d, 1u16)); }
+        for i in 0..6  { data.push((75.0 + i as f64, log_d, 1u16)); }
+
+        let fitted = fit_mixture(
+            &data, 2, 200, 50, 1e-8,
+            5.0_f64.ln(), 0.01_f64.ln(), 1e4_f64.ln(),
+        );
+        assert_eq!(fitted.gamma[0], 0.0);
+        // Truth γ_1 = ln(4) ≈ 1.386; the EM lands near 1.307 here. Same tolerance as Poisson.
+        assert!(
+            (fitted.gamma[1] - 4.0_f64.ln()).abs() < 0.15,
+            "γ_1 expected ≈ ln(4)={:.3}, got {:.3}", 4.0_f64.ln(), fitted.gamma[1]
         );
     }
 }

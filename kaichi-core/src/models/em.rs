@@ -73,7 +73,6 @@ pub fn solve_2x2_sym(h: [f64; 3], g: [f64; 2]) -> Option<[f64; 2]> {
 pub fn run_em<P, F>(init: P, mut step: F, max_iters: u32, tol: f64) -> P
 where
     F: FnMut(P) -> (P, f64),
-    P: Copy,
 {
     let mut params = init;
     let mut last_log_lik = f64::NEG_INFINITY;

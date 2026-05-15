@@ -1,5 +1,5 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_poisson_pmf, logsumexp2, run_em, solve_2x2_sym};
+use super::em::{clamp_probability, log_poisson_pmf, logsumexp2, run_em};
 use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
 
@@ -34,11 +34,14 @@ impl Default for PoissonModel {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct FitParams {
     pi: f64,
     beta0: f64,
     beta1: f64,
+    /// Per-batch log-rate offset. `gamma[0]` is anchored at 0 for identifiability,
+    /// so `beta0` is the batch-0 baseline and `gamma[b]` is batch b's offset.
+    gamma: Vec<f64>,
 }
 
 impl AssignmentModel for PoissonModel {
@@ -51,6 +54,8 @@ impl AssignmentModel for PoissonModel {
         let n_guides = input.counts.n_guides;
         let csc = input.counts.csc();
         let total_counts = &input.covariates.total_counts;
+        let batch = &input.covariates.batch;
+        let n_batches = batch.n_batches();
 
         let log_depths: Vec<f64> = (0..n_cells)
             .map(|i| (total_counts.value(i) as f64 + 1.0).ln())
@@ -60,14 +65,14 @@ impl AssignmentModel for PoissonModel {
             .into_par_iter()
             .map(|g| {
                 let col = csc.get_col(g).unwrap();
-                let data: Vec<(f64, f64)> = col
+                let data: Vec<(f64, f64, u16)> = col
                     .row_indices()
                     .iter()
                     .zip(col.values())
                     .filter(|(_, &v)| v > 0)
-                    .map(|(&i, &v)| (v as f64, log_depths[i]))
+                    .map(|(&i, &v)| (v as f64, log_depths[i], batch.codes[i]))
                     .collect();
-                self.fit_guide(&data)
+                self.fit_guide(&data, n_batches)
             })
             .collect();
 
@@ -78,13 +83,17 @@ impl AssignmentModel for PoissonModel {
 
         for cell in 0..n_cells {
             let log_d = log_depths[cell];
+            let b = batch.codes[cell] as usize;
             let row = csr.get_row(cell).unwrap();
             let mut best: Option<(usize, f32, u32)> = None;
             let mut n_passing: usize = 0;
 
             for (&guide_idx, &count) in row.col_indices().iter().zip(row.values()) {
-                let Some(params) = guide_fits[guide_idx] else { continue };
-                let post = posterior_signal(count as f64, log_d, params) as f32;
+                let params = match &guide_fits[guide_idx] {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let post = posterior_signal(count as f64, log_d, params, b) as f32;
                 if post >= self.min_confidence {
                     n_passing += 1;
                     match best {
@@ -130,13 +139,13 @@ impl AssignmentModel for PoissonModel {
 }
 
 impl PoissonModel {
-    fn fit_guide(&self, data: &[(f64, f64)]) -> Option<FitParams> {
+    fn fit_guide(&self, data: &[(f64, f64, u16)], n_batches: usize) -> Option<FitParams> {
         let n_nonzero = data.len() as u32;
-        let max_count = data.iter().map(|(y, _)| *y as u32).max().unwrap_or(0);
+        let max_count = data.iter().map(|(y, _, _)| *y as u32).max().unwrap_or(0);
         if n_nonzero < self.min_nonzero || max_count < self.min_max_count {
             return None;
         }
-        Some(fit_mixture(data, self.max_em_iters, self.inner_max_iters, self.tol as f64))
+        Some(fit_mixture(data, n_batches, self.max_em_iters, self.inner_max_iters, self.tol as f64))
     }
 }
 
@@ -144,17 +153,24 @@ impl PoissonModel {
 // EM
 // ---------------------------------------------------------------------------
 
-fn fit_mixture(data: &[(f64, f64)], max_em_iters: u32, inner_max_iters: u32, tol: f64) -> FitParams {
-    let init = initialize_params(data);
+fn fit_mixture(
+    data: &[(f64, f64, u16)],
+    n_batches: usize,
+    max_em_iters: u32,
+    inner_max_iters: u32,
+    tol: f64,
+) -> FitParams {
+    let init = initialize_params(data, n_batches);
     let mut responsibilities = vec![0.0f64; data.len()];
 
     run_em(
         init,
         |params| {
             let mut log_lik = 0.0;
-            for (idx, &(y, log_d)) in data.iter().enumerate() {
-                let mu0 = (params.beta0 + log_d).exp();
-                let mu1 = (params.beta0 + params.beta1 + log_d).exp();
+            for (idx, &(y, log_d, b)) in data.iter().enumerate() {
+                let gb = params.gamma[b as usize];
+                let mu0 = (params.beta0 + gb + log_d).exp();
+                let mu1 = (params.beta0 + params.beta1 + gb + log_d).exp();
                 let log_bg = (1.0 - params.pi).ln() + log_poisson_pmf(y, mu0);
                 let log_sig = params.pi.ln() + log_poisson_pmf(y, mu1);
                 let denom = logsumexp2(log_bg, log_sig);
@@ -169,51 +185,138 @@ fn fit_mixture(data: &[(f64, f64)], max_em_iters: u32, inner_max_iters: u32, tol
     )
 }
 
-fn initialize_params(data: &[(f64, f64)]) -> FitParams {
-    let max_y: f64 = data.iter().map(|(y, _)| *y).fold(f64::NEG_INFINITY, f64::max);
-    let mean_depth: f64 = data.iter().map(|(_, d)| d.exp()).sum::<f64>() / data.len() as f64;
-    let mut sorted_y: Vec<f64> = data.iter().map(|(y, _)| *y).collect();
-    sorted_y.sort_by(f64::total_cmp);
-    let median_y = sorted_y[sorted_y.len() / 2].max(1.0);
-    let beta0 = (median_y / mean_depth.max(1e-6)).ln().clamp(-10.0, 10.0);
-    let beta1 = (max_y / median_y).ln().max(0.1);
-    FitParams { pi: 0.1, beta0, beta1 }
+fn initialize_params(data: &[(f64, f64, u16)], n_batches: usize) -> FitParams {
+    let max_y: f64 = data.iter().map(|(y, _, _)| *y).fold(f64::NEG_INFINITY, f64::max);
+    let mean_depth: f64 = data.iter().map(|(_, d, _)| d.exp()).sum::<f64>() / data.len() as f64;
+
+    // Per-batch median y → each batch's baseline goes into γ_b. Without this, a global
+    // median across heterogeneous batches puts the EM in the wrong basin (the alternating
+    // M-step then can't recover because β0 and γ_b are coupled).
+    let mut per_batch_y: Vec<Vec<f64>> = vec![Vec::new(); n_batches];
+    for &(y, _, b) in data {
+        if (b as usize) < n_batches {
+            per_batch_y[b as usize].push(y);
+        }
+    }
+    let per_batch_median: Vec<f64> = per_batch_y
+        .iter_mut()
+        .map(|ys| {
+            if ys.is_empty() {
+                1.0
+            } else {
+                ys.sort_by(f64::total_cmp);
+                ys[ys.len() / 2].max(1.0)
+            }
+        })
+        .collect();
+
+    let m0 = per_batch_median[0];
+    let beta0 = (m0 / mean_depth.max(1e-6)).ln().clamp(-10.0, 10.0);
+    let mut gamma = vec![0.0; n_batches];
+    for b in 1..n_batches {
+        gamma[b] = (per_batch_median[b] / m0).ln().clamp(-5.0, 5.0);
+    }
+
+    // Global max / global median for β1: signal scale shared across batches.
+    let mut all_y: Vec<f64> = data.iter().map(|(y, _, _)| *y).collect();
+    all_y.sort_by(f64::total_cmp);
+    let global_median = all_y[all_y.len() / 2].max(1.0);
+    let beta1 = (max_y / global_median).ln().max(0.1);
+
+    FitParams { pi: 0.1, beta0, beta1, gamma }
 }
 
-fn m_step(params: FitParams, data: &[(f64, f64)], resp: &[f64], inner_max_iters: u32) -> FitParams {
+fn m_step(
+    params: FitParams,
+    data: &[(f64, f64, u16)],
+    resp: &[f64],
+    inner_max_iters: u32,
+) -> FitParams {
     let pi = clamp_probability(resp.iter().sum::<f64>() / data.len() as f64);
-    let mut beta0 = params.beta0;
+    let n_batches = params.gamma.len();
+
+    // Reparameterize: η_b = β0 + γ_b (with η_0 = β0). The Hessian of the Poisson
+    // log-likelihood in (η_0, ..., η_{B-1}, β1) is arrow-shaped — diagonal in η_b
+    // with a single coupling column for β1. We solve it via Schur complement.
+    let mut eta: Vec<f64> = (0..n_batches)
+        .map(|b| params.beta0 + params.gamma[b])
+        .collect();
     let mut beta1 = params.beta1;
 
     for _ in 0..inner_max_iters {
-        let mut g = [0.0f64; 2];
-        let mut fi = [0.0f64; 3]; // Fisher info: [I00, I01, I11]
-        for (&(y, log_d), &r) in data.iter().zip(resp) {
-            let mu0 = (beta0 + log_d).exp();
-            let mu1 = (beta0 + beta1 + log_d).exp();
-            g[0] += (1.0 - r) * (y - mu0) + r * (y - mu1);
-            g[1] += r * (y - mu1);
-            fi[0] += (1.0 - r) * mu0 + r * mu1;
-            fi[1] += r * mu1;
-            fi[2] += r * mu1;
+        // Per-batch score (g_eta[b]) and Hessian diagonal (d[b]),
+        // plus the η_b ↔ β1 cross term (c[b]) and the (β1, β1) entry (s).
+        let mut g_eta = vec![0.0f64; n_batches];
+        let mut d = vec![0.0f64; n_batches];
+        let mut c = vec![0.0f64; n_batches];
+        let mut g_beta1 = 0.0f64;
+        let mut s = 0.0f64;
+
+        for (&(y, log_d, bi), &r) in data.iter().zip(resp) {
+            let b = bi as usize;
+            let mu0 = (eta[b] + log_d).exp();
+            let mu1 = (eta[b] + beta1 + log_d).exp();
+            g_eta[b] += (1.0 - r) * (y - mu0) + r * (y - mu1);
+            g_beta1 += r * (y - mu1);
+            d[b] += (1.0 - r) * mu0 + r * mu1;
+            c[b] += r * mu1;
+            s += r * mu1;
         }
-        let Some(delta) = solve_2x2_sym(fi, g) else { break };
-        let d0 = delta[0].clamp(-3.0, 3.0);
-        let d1 = delta[1].clamp(-3.0, 3.0);
-        beta0 += d0;
-        beta1 += d1;
-        if d0.abs() < 1e-8 && d1.abs() < 1e-8 { break; }
+
+        // Schur complement: eliminate Δη_b from each row, leaving a 1×1 system for Δβ1.
+        let mut schur = s;
+        let mut g_schur = g_beta1;
+        for b in 0..n_batches {
+            if d[b] > 1e-14 {
+                schur -= c[b] * c[b] / d[b];
+                g_schur -= c[b] * g_eta[b] / d[b];
+            }
+        }
+        let d_beta1 = if schur.abs() > 1e-14 {
+            (g_schur / schur).clamp(-3.0, 3.0)
+        } else {
+            0.0
+        };
+
+        // Back-substitute for each Δη_b.
+        let mut max_step = d_beta1.abs();
+        for b in 0..n_batches {
+            let d_eta = if d[b] > 1e-14 {
+                ((g_eta[b] - c[b] * d_beta1) / d[b]).clamp(-3.0, 3.0)
+            } else {
+                0.0
+            };
+            eta[b] += d_eta;
+            max_step = max_step.max(d_eta.abs());
+        }
+        beta1 += d_beta1;
+
+        if max_step < 1e-8 { break; }
     }
 
-    // Ensure beta1 > 0 (signal must have larger mean than background).
-    if beta1 < 0.0 { beta1 = -beta1; }
+    // Recover β0 = η_0 and γ_b = η_b − η_0 (γ_0 ≡ 0 by anchor).
+    let beta0 = eta[0];
+    let mut gamma = vec![0.0; n_batches];
+    for b in 1..n_batches {
+        gamma[b] = eta[b] - eta[0];
+    }
 
-    FitParams { pi, beta0, beta1 }
+    // Identifiability: signal mean > background. If the EM landed at β1 < 0 the labels
+    // got swapped — relabel by absorbing β1 into β0 and flipping π. (Just negating β1
+    // without flipping π would leave π pointing at the low-mean cluster, which is wrong.)
+    let (pi, beta0, beta1) = if beta1 < 0.0 {
+        (1.0 - pi, beta0 + beta1, -beta1)
+    } else {
+        (pi, beta0, beta1)
+    };
+
+    FitParams { pi, beta0, beta1, gamma }
 }
 
-fn posterior_signal(y: f64, log_d: f64, params: FitParams) -> f64 {
-    let mu0 = (params.beta0 + log_d).exp();
-    let mu1 = (params.beta0 + params.beta1 + log_d).exp();
+fn posterior_signal(y: f64, log_d: f64, params: &FitParams, batch_idx: usize) -> f64 {
+    let gb = params.gamma[batch_idx];
+    let mu0 = (params.beta0 + gb + log_d).exp();
+    let mu1 = (params.beta0 + params.beta1 + gb + log_d).exp();
     let log_bg = (1.0 - params.pi).ln() + log_poisson_pmf(y, mu0);
     let log_sig = params.pi.ln() + log_poisson_pmf(y, mu1);
     let denom = logsumexp2(log_bg, log_sig);
@@ -312,23 +415,27 @@ mod tests {
 
     // ---- posterior_signal (Poisson Bayes) ----
 
+    fn fp(pi: f64, beta0: f64, beta1: f64) -> FitParams {
+        FitParams { pi, beta0, beta1, gamma: vec![0.0] }
+    }
+
     #[test]
     fn poisson_posterior_equals_pi_when_components_identical() {
         // β1 = 0 ⇒ μ_signal = μ_bg ⇒ likelihoods identical ⇒ posterior = π.
         for &pi in &[0.05, 0.3, 0.5, 0.8, 0.95] {
-            let p = FitParams { pi, beta0: -1.0, beta1: 0.0 };
-            let post = posterior_signal(3.0, 2.0, p);
+            let p = fp(pi, -1.0, 0.0);
+            let post = posterior_signal(3.0, 2.0, &p, 0);
             assert!((post - pi).abs() < 1e-12, "π={pi}: got {post}");
         }
     }
 
     #[test]
     fn poisson_posterior_monotonic_in_y_when_beta1_positive() {
-        let p = FitParams { pi: 0.3, beta0: -2.0, beta1: 2.5 };
+        let p = fp(0.3, -2.0, 2.5);
         let log_d = (50.0_f64 + 1.0).ln();
         let mut prev = -1.0;
         for y in [0.0, 1.0, 3.0, 8.0, 20.0, 50.0] {
-            let post = posterior_signal(y, log_d, p);
+            let post = posterior_signal(y, log_d, &p, 0);
             assert!(post > prev, "non-monotonic at y={y}: prev={prev}, post={post}");
             prev = post;
         }
@@ -337,28 +444,66 @@ mod tests {
     #[test]
     fn poisson_posterior_saturates() {
         // log_d=0 → μ_bg=e⁰=1, μ_sig=e³≈20. y=50 is overwhelmingly signal.
-        let p = FitParams { pi: 0.2, beta0: 0.0, beta1: 3.0 };
-        assert!(posterior_signal(50.0, 0.0, p) > 0.99);
-        assert!(posterior_signal(0.0, 0.0, p) < 0.2);
+        let p = fp(0.2, 0.0, 3.0);
+        assert!(posterior_signal(50.0, 0.0, &p, 0) > 0.99);
+        assert!(posterior_signal(0.0, 0.0, &p, 0) < 0.2);
+    }
+
+    #[test]
+    fn poisson_posterior_uses_batch_gamma() {
+        // Two batches, γ_1 > 0 → μ_bg in batch 1 is e^(γ_1)× larger than in batch 0.
+        // Same y at log_d=0 should give a LOWER signal posterior in batch 1 (the count
+        // looks more like background in a batch with higher baseline rate).
+        let p = FitParams { pi: 0.3, beta0: -2.0, beta1: 2.0, gamma: vec![0.0, 1.5] };
+        let post_b0 = posterior_signal(5.0, 0.0, &p, 0);
+        let post_b1 = posterior_signal(5.0, 0.0, &p, 1);
+        assert!(post_b0 > post_b1, "γ_1 > 0 should reduce signal posterior in batch 1: b0={post_b0}, b1={post_b1}");
     }
 
     // ---- fit_mixture: synthetic recovery ----
 
     #[test]
     fn fit_mixture_recovers_bimodal_poisson() {
-        // 12 background (counts 0–2) + 8 signal (counts 18–25), uniform depth 50.
+        // 12 background (counts 0–2) + 8 signal (counts 18–25), uniform depth 50, single batch.
         let log_d = (50.0_f64 + 1.0).ln();
-        let mut data: Vec<(f64, f64)> = (0..12).map(|i| ((i % 3) as f64, log_d)).collect();
-        data.extend((0..8).map(|i| (18.0 + i as f64, log_d)));
+        let mut data: Vec<(f64, f64, u16)> = (0..12).map(|i| ((i % 3) as f64, log_d, 0u16)).collect();
+        data.extend((0..8).map(|i| (18.0 + i as f64, log_d, 0u16)));
 
-        let fitted = fit_mixture(&data, 200, 25, 1e-8);
+        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8);
         let mu_bg = (fitted.beta0 + log_d).exp();
         let mu_sig = (fitted.beta0 + fitted.beta1 + log_d).exp();
 
         assert!(mu_sig > mu_bg, "μ_sig={mu_sig} ≤ μ_bg={mu_bg}");
         assert!(mu_bg < 5.0, "μ_bg should track low cluster, got {mu_bg}");
         assert!(mu_sig > 15.0, "μ_sig should track high cluster, got {mu_sig}");
-        // 8 of 20 = 0.4 signal weight.
         assert!((0.2..=0.6).contains(&fitted.pi), "pi: {}", fitted.pi);
+        assert_eq!(fitted.gamma.len(), 1);
+        assert_eq!(fitted.gamma[0], 0.0, "γ_0 must stay anchored at 0");
+    }
+
+    #[test]
+    fn fit_mixture_recovers_batch_offsets() {
+        // Two batches with the SAME signal/background structure but DIFFERENT baselines.
+        // Batch 0: bg ≈ 1, sig ≈ 20  (β0 ≈ -3.9 at log_d≈3.9, so μ_bg = 1.)
+        // Batch 1: bg ≈ 4, sig ≈ 80  (γ_1 ≈ ln(4) ≈ 1.39 above batch 0.)
+        // After fit, γ_1 > 0 and roughly recovers the batch-1 baseline offset.
+        let log_d = (50.0_f64 + 1.0).ln();
+        let mut data: Vec<(f64, f64, u16)> = Vec::new();
+        // batch 0: 10 bg + 6 sig
+        for i in 0..10 { data.push(((i % 2 + 1) as f64, log_d, 0u16)); }       // y = 1 or 2
+        for i in 0..6  { data.push((18.0 + i as f64, log_d, 0u16)); }          // y ≈ 20
+        // batch 1: 10 bg + 6 sig at 4× the rate
+        for i in 0..10 { data.push(((i % 2 + 4) as f64, log_d, 1u16)); }       // y = 4 or 5
+        for i in 0..6  { data.push((75.0 + i as f64, log_d, 1u16)); }          // y ≈ 80
+
+        let fitted = fit_mixture(&data, 2, 200, 50, 1e-8);
+        assert!(fitted.gamma[0] == 0.0, "γ_0 anchored");
+        // Truth γ_1 = ln(4) ≈ 1.386; with this synthetic data the EM lands near 1.307.
+        // 0.15 window catches a 2× drift from the current fit while remaining tight enough
+        // to flag a real regression.
+        assert!(
+            (fitted.gamma[1] - 4.0_f64.ln()).abs() < 0.15,
+            "γ_1 expected ≈ ln(4)={:.3}, got {:.3}", 4.0_f64.ln(), fitted.gamma[1]
+        );
     }
 }

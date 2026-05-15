@@ -1,5 +1,5 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_binom_pmf, logsumexp2, run_em, sigmoid, solve_2x2_sym};
+use super::em::{clamp_probability, log_binom_pmf, logsumexp2, run_em, sigmoid};
 use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
 
@@ -33,11 +33,13 @@ impl Default for BinomialModel {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct FitParams {
     pi: f64,
     beta0: f64,
     beta1: f64,
+    /// Per-batch logit offset; `gamma[0]` is anchored at 0 for identifiability.
+    gamma: Vec<f64>,
 }
 
 impl AssignmentModel for BinomialModel {
@@ -50,6 +52,8 @@ impl AssignmentModel for BinomialModel {
         let n_guides = input.counts.n_guides;
         let csc = input.counts.csc();
         let total_counts = &input.covariates.total_counts;
+        let batch = &input.covariates.batch;
+        let n_batches = batch.n_batches();
 
         // Per-cell trial count (total guide UMIs).
         let trial_counts: Vec<f64> = (0..n_cells)
@@ -60,15 +64,15 @@ impl AssignmentModel for BinomialModel {
             .into_par_iter()
             .map(|g| {
                 let col = csc.get_col(g).unwrap();
-                // Data: (y_i, n_i) where y_i = guide count, n_i = total guide UMIs.
-                let data: Vec<(f64, f64)> = col
+                // Data: (y_i, n_i, b_i) where y_i = guide count, n_i = total UMIs, b_i = batch.
+                let data: Vec<(f64, f64, u16)> = col
                     .row_indices()
                     .iter()
                     .zip(col.values())
                     .filter(|(&i, &v)| v > 0 && trial_counts[i] > 0.0)
-                    .map(|(&i, &v)| (v as f64, trial_counts[i]))
+                    .map(|(&i, &v)| (v as f64, trial_counts[i], batch.codes[i]))
                     .collect();
-                self.fit_guide(&data)
+                self.fit_guide(&data, n_batches)
             })
             .collect();
 
@@ -79,14 +83,18 @@ impl AssignmentModel for BinomialModel {
 
         for cell in 0..n_cells {
             let n_i = trial_counts[cell];
+            let b = batch.codes[cell] as usize;
             let row = csr.get_row(cell).unwrap();
             let mut best: Option<(usize, f32, u32)> = None;
             let mut n_passing: usize = 0;
 
             for (&guide_idx, &count) in row.col_indices().iter().zip(row.values()) {
-                let Some(params) = guide_fits[guide_idx] else { continue };
+                let params = match &guide_fits[guide_idx] {
+                    Some(p) => p,
+                    None => continue,
+                };
                 if n_i <= 0.0 { continue; }
-                let post = posterior_signal(count as f64, n_i, params) as f32;
+                let post = posterior_signal(count as f64, n_i, params, b) as f32;
                 if post >= self.min_confidence {
                     n_passing += 1;
                     match best {
@@ -132,13 +140,13 @@ impl AssignmentModel for BinomialModel {
 }
 
 impl BinomialModel {
-    fn fit_guide(&self, data: &[(f64, f64)]) -> Option<FitParams> {
+    fn fit_guide(&self, data: &[(f64, f64, u16)], n_batches: usize) -> Option<FitParams> {
         let n_nonzero = data.len() as u32;
-        let max_count = data.iter().map(|(y, _)| *y as u32).max().unwrap_or(0);
+        let max_count = data.iter().map(|(y, _, _)| *y as u32).max().unwrap_or(0);
         if n_nonzero < self.min_nonzero || max_count < self.min_max_count {
             return None;
         }
-        Some(fit_mixture(data, self.max_em_iters, self.inner_max_iters, self.tol as f64))
+        Some(fit_mixture(data, n_batches, self.max_em_iters, self.inner_max_iters, self.tol as f64))
     }
 }
 
@@ -146,17 +154,24 @@ impl BinomialModel {
 // EM
 // ---------------------------------------------------------------------------
 
-fn fit_mixture(data: &[(f64, f64)], max_em_iters: u32, inner_max_iters: u32, tol: f64) -> FitParams {
-    let init = initialize_params(data);
+fn fit_mixture(
+    data: &[(f64, f64, u16)],
+    n_batches: usize,
+    max_em_iters: u32,
+    inner_max_iters: u32,
+    tol: f64,
+) -> FitParams {
+    let init = initialize_params(data, n_batches);
     let mut responsibilities = vec![0.0f64; data.len()];
 
     run_em(
         init,
         |params| {
-            let p0 = sigmoid(params.beta0);
-            let p1 = sigmoid(params.beta0 + params.beta1);
             let mut log_lik = 0.0;
-            for (idx, &(y, n)) in data.iter().enumerate() {
+            for (idx, &(y, n, b)) in data.iter().enumerate() {
+                let gb = params.gamma[b as usize];
+                let p0 = sigmoid(params.beta0 + gb);
+                let p1 = sigmoid(params.beta0 + params.beta1 + gb);
                 let log_bg = (1.0 - params.pi).ln() + log_binom_pmf(y, n, p0);
                 let log_sig = params.pi.ln() + log_binom_pmf(y, n, p1);
                 let denom = logsumexp2(log_bg, log_sig);
@@ -171,51 +186,116 @@ fn fit_mixture(data: &[(f64, f64)], max_em_iters: u32, inner_max_iters: u32, tol
     )
 }
 
-fn initialize_params(data: &[(f64, f64)]) -> FitParams {
-    // Initialize with background p ≈ mean(y/n) and signal p higher.
-    let mean_prop: f64 = data.iter().map(|(y, n)| y / n).sum::<f64>() / data.len() as f64;
-    let max_prop: f64 = data.iter().map(|(y, n)| y / n).fold(0.0_f64, f64::max);
-    let beta0 = (mean_prop / (1.0 - mean_prop).max(1e-6)).ln().clamp(-5.0, 5.0);
-    let beta1 = ((max_prop / (1.0 - max_prop).max(1e-6)).ln() - beta0).max(0.5);
-    FitParams { pi: 0.1, beta0, beta1 }
+fn initialize_params(data: &[(f64, f64, u16)], n_batches: usize) -> FitParams {
+    // Per-batch background logit: log(mean_prop_b / (1 − mean_prop_b)).
+    // Batch-0 baseline goes into β0; γ_b = batch-b logit − batch-0 logit for b > 0.
+    let mut per_batch_y: Vec<f64> = vec![0.0; n_batches];
+    let mut per_batch_n: Vec<f64> = vec![0.0; n_batches];
+    for &(y, n, b) in data {
+        per_batch_y[b as usize] += y;
+        per_batch_n[b as usize] += n;
+    }
+    let logit_of = |p: f64| -> f64 {
+        let p = p.clamp(1e-6, 1.0 - 1e-6);
+        (p / (1.0 - p)).ln()
+    };
+    let mean_prop_b: Vec<f64> = per_batch_y.iter().zip(&per_batch_n)
+        .map(|(y, n)| if *n > 0.0 { y / n } else { 0.01 })
+        .collect();
+    let beta0 = logit_of(mean_prop_b[0]).clamp(-5.0, 5.0);
+    let mut gamma = vec![0.0; n_batches];
+    for b in 1..n_batches {
+        gamma[b] = (logit_of(mean_prop_b[b]) - beta0).clamp(-5.0, 5.0);
+    }
+
+    // β1 from the global max proportion vs global mean — signal scale shared across batches.
+    let max_prop: f64 = data.iter().map(|(y, n, _)| y / n).fold(0.0_f64, f64::max);
+    let mean_prop_all: f64 = data.iter().map(|(y, n, _)| y / n).sum::<f64>() / data.len() as f64;
+    let beta1 = (logit_of(max_prop) - logit_of(mean_prop_all)).max(0.5);
+
+    FitParams { pi: 0.1, beta0, beta1, gamma }
 }
 
-fn m_step(params: FitParams, data: &[(f64, f64)], resp: &[f64], inner_max_iters: u32) -> FitParams {
+fn m_step(
+    params: FitParams,
+    data: &[(f64, f64, u16)],
+    resp: &[f64],
+    inner_max_iters: u32,
+) -> FitParams {
     let pi = clamp_probability(resp.iter().sum::<f64>() / data.len() as f64);
-    let mut beta0 = params.beta0;
+    let n_batches = params.gamma.len();
+
+    // Arrow-Hessian Schur step in (η_0, ..., η_{B−1}, β1). Binomial IRLS weight is n·p·(1−p).
+    let mut eta: Vec<f64> = (0..n_batches)
+        .map(|b| params.beta0 + params.gamma[b])
+        .collect();
     let mut beta1 = params.beta1;
 
     for _ in 0..inner_max_iters {
-        let p0 = sigmoid(beta0);
-        let p1 = sigmoid(beta0 + beta1);
+        let mut g_eta = vec![0.0f64; n_batches];
+        let mut d = vec![0.0f64; n_batches];
+        let mut c = vec![0.0f64; n_batches];
+        let mut g_beta1 = 0.0f64;
+        let mut s = 0.0f64;
 
-        let mut g = [0.0f64; 2];
-        let mut fi = [0.0f64; 3]; // Fisher info: [I00, I01, I11]
-        for (&(y, n), &r) in data.iter().zip(resp) {
-            // Score ∂log_binom/∂β = n·(y/n - p)·∂p/∂β, ∂p/∂β = p(1-p) for logit link
-            g[0] += (1.0 - r) * (y - n * p0) + r * (y - n * p1);
-            g[1] += r * (y - n * p1);
-            // Fisher info (working weight for binomial logistic): n·p·(1-p)
-            fi[0] += (1.0 - r) * n * p0 * (1.0 - p0) + r * n * p1 * (1.0 - p1);
-            fi[1] += r * n * p1 * (1.0 - p1);
-            fi[2] += r * n * p1 * (1.0 - p1);
+        for (&(y, n, bi), &r) in data.iter().zip(resp) {
+            let b = bi as usize;
+            let p0 = sigmoid(eta[b]);
+            let p1 = sigmoid(eta[b] + beta1);
+            g_eta[b] += (1.0 - r) * (y - n * p0) + r * (y - n * p1);
+            g_beta1 += r * (y - n * p1);
+            let w0 = n * p0 * (1.0 - p0);
+            let w1 = n * p1 * (1.0 - p1);
+            d[b] += (1.0 - r) * w0 + r * w1;
+            c[b] += r * w1;
+            s += r * w1;
         }
-        let Some(delta) = solve_2x2_sym(fi, g) else { break };
-        let d0 = delta[0].clamp(-3.0, 3.0);
-        let d1 = delta[1].clamp(-3.0, 3.0);
-        beta0 += d0;
-        beta1 += d1;
-        if d0.abs() < 1e-8 && d1.abs() < 1e-8 { break; }
+
+        let mut schur = s;
+        let mut g_schur = g_beta1;
+        for b in 0..n_batches {
+            if d[b] > 1e-14 {
+                schur -= c[b] * c[b] / d[b];
+                g_schur -= c[b] * g_eta[b] / d[b];
+            }
+        }
+        let d_beta1 = if schur.abs() > 1e-14 {
+            (g_schur / schur).clamp(-3.0, 3.0)
+        } else { 0.0 };
+
+        let mut max_step = d_beta1.abs();
+        for b in 0..n_batches {
+            let d_eta = if d[b] > 1e-14 {
+                ((g_eta[b] - c[b] * d_beta1) / d[b]).clamp(-3.0, 3.0)
+            } else { 0.0 };
+            eta[b] += d_eta;
+            max_step = max_step.max(d_eta.abs());
+        }
+        beta1 += d_beta1;
+
+        if max_step < 1e-8 { break; }
     }
 
-    if beta1 < 0.0 { beta1 = -beta1; }
+    let beta0 = eta[0];
+    let mut gamma = vec![0.0; n_batches];
+    for b in 1..n_batches {
+        gamma[b] = eta[b] - eta[0];
+    }
 
-    FitParams { pi, beta0, beta1 }
+    // Same identifiability relabel as Poisson; see comment there.
+    let (pi, beta0, beta1) = if beta1 < 0.0 {
+        (1.0 - pi, beta0 + beta1, -beta1)
+    } else {
+        (pi, beta0, beta1)
+    };
+
+    FitParams { pi, beta0, beta1, gamma }
 }
 
-fn posterior_signal(y: f64, n: f64, params: FitParams) -> f64 {
-    let p0 = sigmoid(params.beta0);
-    let p1 = sigmoid(params.beta0 + params.beta1);
+fn posterior_signal(y: f64, n: f64, params: &FitParams, batch_idx: usize) -> f64 {
+    let gb = params.gamma[batch_idx];
+    let p0 = sigmoid(params.beta0 + gb);
+    let p1 = sigmoid(params.beta0 + params.beta1 + gb);
     let log_bg = (1.0 - params.pi).ln() + log_binom_pmf(y, n, p0);
     let log_sig = params.pi.ln() + log_binom_pmf(y, n, p1);
     let denom = logsumexp2(log_bg, log_sig);
@@ -315,50 +395,57 @@ mod tests {
 
     // ---- posterior_signal (Binomial Bayes) ----
 
+    fn fp(pi: f64, beta0: f64, beta1: f64) -> FitParams {
+        FitParams { pi, beta0, beta1, gamma: vec![0.0] }
+    }
+
     #[test]
     fn binomial_posterior_equals_pi_when_components_identical() {
-        // β1 = 0 ⇒ p_signal = p_bg ⇒ likelihoods identical ⇒ posterior = π.
         for &pi in &[0.05, 0.3, 0.5, 0.8, 0.95] {
-            let p = FitParams { pi, beta0: -2.0, beta1: 0.0 };
-            let post = posterior_signal(5.0, 50.0, p);
+            let p = fp(pi, -2.0, 0.0);
+            let post = posterior_signal(5.0, 50.0, &p, 0);
             assert!((post - pi).abs() < 1e-12, "π={pi}: got {post}");
         }
     }
 
     #[test]
     fn binomial_posterior_monotonic_in_y_when_beta1_positive() {
-        // logit(p_bg) = -3, logit(p_sig) = 1 ⇒ p_bg ≈ 0.047, p_sig ≈ 0.73.
-        // Saturates rapidly under f64; test non-decreasing globally and strict
-        // monotonicity in the un-saturated low-y range.
-        let p = FitParams { pi: 0.3, beta0: -3.0, beta1: 4.0 };
+        let p = fp(0.3, -3.0, 4.0);
         let n = 50.0;
         let ys = [0.0, 1.0, 5.0, 10.0, 15.0, 30.0, 45.0];
-        let posts: Vec<f64> = ys.iter().map(|&y| posterior_signal(y, n, p)).collect();
+        let posts: Vec<f64> = ys.iter().map(|&y| posterior_signal(y, n, &p, 0)).collect();
         for w in posts.windows(2) {
             assert!(w[1] >= w[0], "posterior decreased: {} → {}", w[0], w[1]);
         }
-        // Strict increase over the un-saturated stretch (y = 0..10).
         assert!(posts[0] < posts[3], "no strict increase 0 → 10: {} → {}", posts[0], posts[3]);
     }
 
     #[test]
     fn binomial_posterior_saturates() {
-        // p_bg ≈ 0.047, p_sig ≈ 0.73; y=45/50 is overwhelmingly signal, y=0/50 overwhelmingly bg.
-        let p = FitParams { pi: 0.2, beta0: -3.0, beta1: 4.0 };
-        assert!(posterior_signal(45.0, 50.0, p) > 0.99);
-        assert!(posterior_signal(0.0, 50.0, p) < 0.2);
+        let p = fp(0.2, -3.0, 4.0);
+        assert!(posterior_signal(45.0, 50.0, &p, 0) > 0.99);
+        assert!(posterior_signal(0.0, 50.0, &p, 0) < 0.2);
+    }
+
+    #[test]
+    fn binomial_posterior_uses_batch_gamma() {
+        // γ_1 > 0 raises batch 1's logit baseline → same y/n looks more like background.
+        let p = FitParams { pi: 0.3, beta0: -3.0, beta1: 3.0, gamma: vec![0.0, 2.0] };
+        let b0 = posterior_signal(5.0, 50.0, &p, 0);
+        let b1 = posterior_signal(5.0, 50.0, &p, 1);
+        assert!(b0 > b1, "γ_1 > 0 should suppress signal in batch 1: b0={b0}, b1={b1}");
     }
 
     // ---- fit_mixture: synthetic recovery ----
 
     #[test]
     fn fit_mixture_recovers_bimodal_binomial() {
-        // 12 background (1–2 of 50, prop ≈ 0.03) + 8 signal (38–45 of 50, prop ≈ 0.83).
+        // 12 background (1–2 of 50, prop ≈ 0.03) + 8 signal (38–45 of 50, prop ≈ 0.83), single batch.
         let n = 50.0;
-        let mut data: Vec<(f64, f64)> = (0..12).map(|i| (1.0 + (i % 2) as f64, n)).collect();
-        data.extend((0..8).map(|i| (38.0 + i as f64, n)));
+        let mut data: Vec<(f64, f64, u16)> = (0..12).map(|i| (1.0 + (i % 2) as f64, n, 0u16)).collect();
+        data.extend((0..8).map(|i| (38.0 + i as f64, n, 0u16)));
 
-        let fitted = fit_mixture(&data, 200, 25, 1e-8);
+        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8);
         let p_bg = sigmoid(fitted.beta0);
         let p_sig = sigmoid(fitted.beta0 + fitted.beta1);
 
@@ -366,5 +453,30 @@ mod tests {
         assert!(p_bg < 0.10, "p_bg should track low cluster (~0.03), got {p_bg}");
         assert!(p_sig > 0.70, "p_sig should track high cluster (~0.83), got {p_sig}");
         assert!((0.2..=0.6).contains(&fitted.pi), "pi: {}", fitted.pi);
+        assert_eq!(fitted.gamma, vec![0.0]);
+    }
+
+    #[test]
+    fn fit_mixture_recovers_batch_offsets() {
+        // Two batches: same signal pattern but batch 1's background runs at ~3× the
+        // batch-0 background proportion → γ_1 should land positive.
+        let n = 50.0;
+        let mut data: Vec<(f64, f64, u16)> = Vec::new();
+        // batch 0: 12 bg (y = 1 or 2) + 8 sig (y ≈ 40)
+        for i in 0..12 { data.push((1.0 + (i % 2) as f64, n, 0u16)); }
+        for i in 0..8  { data.push((38.0 + i as f64, n, 0u16)); }
+        // batch 1: 12 bg (y = 4 or 5) + 8 sig (y ≈ 45)
+        for i in 0..12 { data.push((4.0 + (i % 2) as f64, n, 1u16)); }
+        for i in 0..8  { data.push((42.0 + i as f64, n, 1u16)); }
+
+        let fitted = fit_mixture(&data, 2, 200, 50, 1e-8);
+        assert_eq!(fitted.gamma[0], 0.0);
+        // Truth γ_1 ≈ logit(4.5/50) − logit(1.5/50) ≈ 1.17; the EM lands near 0.90 here
+        // (binomial logit pulls in toward 0 more than Poisson β0 does at small p). Window
+        // is wider than Poisson's to absorb that systematic bias without being toothless.
+        assert!(
+            (fitted.gamma[1] - 1.17).abs() < 0.30,
+            "γ_1 expected ≈ 1.17, got {:.3}", fitted.gamma[1]
+        );
     }
 }
