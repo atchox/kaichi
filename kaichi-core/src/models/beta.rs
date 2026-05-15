@@ -94,17 +94,22 @@ impl AssignmentModel for Beta2Model {
         let n_guides = input.counts.n_guides;
         let csr = input.counts.csr();
         let total_counts = &input.covariates.total_counts;
+        let batch = &input.covariates.batch;
 
         let props = max_proportions(
             csr, n_cells, total_counts,
             self.clamp_lo as f64, self.clamp_hi as f64,
         );
 
-        let fitted = fit_beta2(
-            &props.iter().filter_map(|&(p, _, _)| if p > 0.0 { Some(p) } else { None }).collect::<Vec<_>>(),
-            self.max_em_iters,
-            self.tol as f64,
-        );
+        // Per-batch fit: one mixture per batch over all that batch's cells. Matches
+        // the design-doc spec for beta2; reduces to a single fit when batches=1.
+        let cells_by_batch = batch.cells_by_batch();
+        let batch_fits: Vec<Beta2Params> = cells_by_batch.iter().map(|cells| {
+            let batch_props: Vec<f64> = cells.iter()
+                .filter_map(|&i| if props[i].0 > 0.0 { Some(props[i].0) } else { None })
+                .collect();
+            fit_beta2(&batch_props, self.max_em_iters, self.tol as f64)
+        }).collect();
 
         let guide_ids_arr = &input.guide_metadata.guide_ids;
         let cell_barcodes = &input.covariates.cell_barcodes;
@@ -116,6 +121,7 @@ impl AssignmentModel for Beta2Model {
                 out.append_unassigned(0);
                 continue;
             }
+            let fitted = batch_fits[batch.codes[cell] as usize];
             let post = posterior_high_2(prop, fitted) as f32;
             if post >= self.min_confidence {
                 out.append_assigned(guide_ids_arr.value(guide_idx), count, post, false, 1);
@@ -147,17 +153,20 @@ impl AssignmentModel for Beta3Model {
         let n_guides = input.counts.n_guides;
         let csr = input.counts.csr();
         let total_counts = &input.covariates.total_counts;
+        let batch = &input.covariates.batch;
 
         let props = max_proportions(
             csr, n_cells, total_counts,
             self.clamp_lo as f64, self.clamp_hi as f64,
         );
 
-        let fitted = fit_beta3(
-            &props.iter().filter_map(|&(p, _, _)| if p > 0.0 { Some(p) } else { None }).collect::<Vec<_>>(),
-            self.max_em_iters,
-            self.tol as f64,
-        );
+        let cells_by_batch = batch.cells_by_batch();
+        let batch_fits: Vec<Beta3Params> = cells_by_batch.iter().map(|cells| {
+            let batch_props: Vec<f64> = cells.iter()
+                .filter_map(|&i| if props[i].0 > 0.0 { Some(props[i].0) } else { None })
+                .collect();
+            fit_beta3(&batch_props, self.max_em_iters, self.tol as f64)
+        }).collect();
 
         let guide_ids_arr = &input.guide_metadata.guide_ids;
         let cell_barcodes = &input.covariates.cell_barcodes;
@@ -170,6 +179,7 @@ impl AssignmentModel for Beta3Model {
                 continue;
             }
             // Only the high (h) component is treated as signal.
+            let fitted = batch_fits[batch.codes[cell] as usize];
             let post = posterior_high_3(prop, fitted) as f32;
             if post >= self.min_confidence {
                 out.append_assigned(guide_ids_arr.value(guide_idx), count, post, false, 1);
@@ -236,6 +246,9 @@ fn max_proportions(
 
 fn fit_beta2(props: &[f64], max_em_iters: u32, tol: f64) -> Beta2Params {
     let init = Beta2Params { pi: 0.4, al: 1.0, bl: 10.0, ah: 10.0, bh: 1.0 };
+    if props.is_empty() {
+        return init;
+    }
     let mut r_h = vec![0.0f64; props.len()];
 
     run_em(
@@ -294,6 +307,9 @@ fn fit_beta3(props: &[f64], max_em_iters: u32, tol: f64) -> Beta3Params {
         am: 10.0, bm: 10.0,
         ah: 10.0, bh: 1.0,
     };
+    if props.is_empty() {
+        return init;
+    }
     let n = props.len();
     let mut r = vec![[0.0f64; 3]; n]; // [r_l, r_m, r_h]
 
@@ -396,7 +412,7 @@ fn beta_mom_weighted(props: &[f64], weights: &[f64], signal_weight: bool) -> (f6
 mod tests {
     use super::*;
     use super::super::test_support::{input_with_row_sums as make_input, input_with_totals};
-    use crate::data::CountMatrix;
+    use crate::data::{CountMatrix, Covariates};
     use arrow::array::{BooleanArray, Float32Array};
 
     fn is_unassigned(r: &AssignmentResult) -> &BooleanArray {
@@ -738,6 +754,85 @@ mod tests {
             let gb = gamma(beta_, &mut next);
             ga / (ga + gb)
         }).collect()
+    }
+
+    #[test]
+    fn beta2_batch_0_unchanged_by_added_batch_1_cells() {
+        // Per-batch fitting means batch 0's fit, and therefore every batch-0 cell's
+        // posterior and assignment, depends ONLY on batch 0's own cells. This invariance
+        // is the real correctness criterion — if a future regression switched the
+        // implementation back to pooled fitting, batch 1's cells would influence
+        // batch 0's posteriors and this test would catch it.
+        //
+        // We construct counts so that max_prop = (single guide UMI) / (explicit total).
+        use super::super::test_support::input_with_batch;
+        use arrow::array::{Array, Float32Array as F32};
+
+        // 10 batch-0 cells: 5 at prop=0.2, 5 at prop=0.9.
+        let mut triples_solo = Vec::new();
+        let mut totals_solo = vec![0u32; 10];
+        for c in 0..5 { triples_solo.push((c, 0, 2u32)); totals_solo[c] = 10; }
+        for c in 5..10 { triples_solo.push((c, 0, 9u32)); totals_solo[c] = 10; }
+        let codes_solo: Vec<u16> = vec![0; 10];
+        let solo = input_with_batch(10, 1, triples_solo.clone(), codes_solo, vec!["b0"]);
+        let solo = LoadedInput {
+            counts: solo.counts,
+            covariates: Covariates {
+                cell_barcodes: solo.covariates.cell_barcodes,
+                total_counts: F32::from(totals_solo.iter().map(|&t| t as f32).collect::<Vec<_>>()),
+                batch: solo.covariates.batch,
+            },
+            guide_metadata: solo.guide_metadata,
+        };
+
+        // Same 10 batch-0 cells PLUS 30 batch-1 cells at prop=0.5 (a distribution that
+        // looks nothing like batch 0). Under pooled fitting these would skew the fit
+        // and would change the batch-0 posteriors.
+        let mut triples_both = triples_solo.clone();
+        let mut totals_both = totals_solo.clone();
+        totals_both.extend(vec![10u32; 30]);
+        for c in 10..40 { triples_both.push((c, 0, 5u32)); }
+        let codes_both: Vec<u16> = (0..40).map(|c| if c < 10 { 0 } else { 1 }).collect();
+        let both = input_with_batch(40, 1, triples_both, codes_both, vec!["b0", "b1"]);
+        let both = LoadedInput {
+            counts: both.counts,
+            covariates: Covariates {
+                cell_barcodes: both.covariates.cell_barcodes,
+                total_counts: F32::from(totals_both.iter().map(|&t| t as f32).collect::<Vec<_>>()),
+                batch: both.covariates.batch,
+            },
+            guide_metadata: both.guide_metadata,
+        };
+
+        let model = Beta2Model { min_confidence: 0.5, ..Default::default() };
+        let r_solo = model.assign(&solo).unwrap();
+        let r_both = model.assign(&both).unwrap();
+
+        let is_u_solo = is_unassigned(&r_solo);
+        let is_u_both = is_unassigned(&r_both);
+        let conf_solo = r_solo.batch.column_by_name("assignment_confidence").unwrap()
+            .as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+        let conf_both = r_both.batch.column_by_name("assignment_confidence").unwrap()
+            .as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+
+        // For every batch-0 cell (indices 0..10), both the boolean assignment AND the
+        // posterior must be identical between the two runs.
+        for c in 0..10 {
+            assert_eq!(
+                is_u_solo.value(c), is_u_both.value(c),
+                "cell {c}: assignment differs solo={} both={}",
+                is_u_solo.value(c), is_u_both.value(c),
+            );
+            let s = if conf_solo.is_null(c) { f32::NAN } else { conf_solo.value(c) };
+            let b = if conf_both.is_null(c) { f32::NAN } else { conf_both.value(c) };
+            // Either both null or values equal bit-for-bit (deterministic EM on same data).
+            if !s.is_nan() || !b.is_nan() {
+                assert_eq!(
+                    s.to_bits(), b.to_bits(),
+                    "cell {c}: posterior differs solo={s} both={b}",
+                );
+            }
+        }
     }
 
     #[test]

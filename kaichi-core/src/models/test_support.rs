@@ -62,6 +62,32 @@ pub fn input_with_totals(
     }
 }
 
+/// `total_counts` from row sums + caller-supplied batch labels. Used when a
+/// test needs to exercise per-batch behavior.
+pub fn input_with_batch(
+    n_cells: usize,
+    n_guides: usize,
+    triples: Vec<(usize, usize, u32)>,
+    batch_codes: Vec<u16>,
+    batch_categories: Vec<&str>,
+) -> LoadedInput {
+    let mut totals = vec![0u32; n_cells];
+    for &(r, _, v) in &triples {
+        totals[r] += v;
+    }
+    let mut input = input_with_totals(
+        n_cells,
+        n_guides,
+        triples,
+        totals.iter().map(|&t| t as f32).collect(),
+    );
+    input.covariates.batch = BatchLabels {
+        codes: batch_codes,
+        categories: batch_categories.into_iter().map(String::from).collect(),
+    };
+    input
+}
+
 /// `total_counts` derived from row sums of the count matrix.
 /// Use this when the model treats `total_counts` as "sum of guide UMIs per cell".
 pub fn input_with_row_sums(
