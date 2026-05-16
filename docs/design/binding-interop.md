@@ -134,17 +134,24 @@ Authoritative versions live in `kaichi-py/Cargo.toml` and the workspace
 
 ### Build / dev flow
 
+The repo uses `pixi` (conda-forge-backed) for Python + system deps; the Rust
+toolchain stays under `rustup` (`rust-toolchain.toml`).
+
 ```sh
 # one-time setup
-uv venv .venv
-uv pip install maturin pytest pyarrow anndata scipy numpy
+pixi install
 
-# build + install the extension into the venv
-maturin develop --manifest-path kaichi-py/Cargo.toml
+# build the Python extension into the pixi env, then run Python tests
+pixi run test-py
 
-# run Python tests
-pytest tests/python/
+# or step-by-step:
+pixi run build-py    # maturin develop only
+pixi run cargo-test  # the Rust test suite
 ```
+
+`pixi.toml` lives at the repo root. Python deps (maturin, pyarrow, anndata,
+scipy, pytest) and the HDF5 system lib that `hdf5-metno` links against are
+all declared there.
 
 ### What v0.1 deliberately omits
 

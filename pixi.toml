@@ -1,0 +1,37 @@
+# kaichi development environment.
+#
+# Manages the Python toolchain and system deps for binding work and tests.
+# The Rust toolchain is *not* in here — `rust-toolchain.toml` + rustup own that,
+# to keep one source of truth for cargo builds.
+#
+# Common entry points:
+#   pixi install                       # set up the env
+#   pixi run cargo-test                # run the Rust test suite
+#   pixi run build-py                  # maturin develop the Python binding
+#   pixi run test-py                   # run Python tests against the built wheel
+
+[workspace]
+name = "kaichi"
+description = "Perturb-seq guide assignment toolkit"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+[dependencies]
+python = ">=3.10,<3.13"
+# build
+maturin = ">=1.5"
+# runtime / API
+pyarrow = ">=14"
+anndata = ">=0.10"
+scipy = ">=1.11"
+numpy = ">=1.26"
+pandas = ">=2"
+# tests
+pytest = ">=8"
+# system lib used by hdf5-metno (the Rust HDF5 crate links against this)
+hdf5 = ">=1.14"
+
+[tasks]
+cargo-test = "cargo test -p kaichi-core"
+build-py   = "maturin develop --manifest-path kaichi-py/Cargo.toml"
+test-py    = { cmd = "pytest tests/python/", depends-on = ["build-py"] }
