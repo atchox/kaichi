@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kaichi"
+version = "0.1.0"
+description = "Perturb-seq guide assignment — Python bindings to the kaichi-core Rust library"
+readme = "../README.md"
+license = { text = "MIT" }
+authors = [{ name = "kaichi contributors" }]
+requires-python = ">=3.11"
+dependencies = [
+    "anndata>=0.10",
+    "scipy>=1.11",
+    "numpy>=1.26",
+    "pandas>=2",
+    "pyarrow>=14",
+]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+# The Rust crate (kaichi-py/Cargo.toml) builds a `kaichi` cdylib.
+# Python wrapper code lives under python/kaichi/ and is shipped alongside the
+# compiled extension, which lands at kaichi._native.
+python-source = "python"
+module-name = "kaichi._native"
+features = ["pyo3/extension-module"]

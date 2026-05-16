@@ -17,7 +17,7 @@ channels = ["conda-forge"]
 platforms = ["osx-arm64", "osx-64", "linux-64"]
 
 [dependencies]
-python = ">=3.10,<3.13"
+python = ">=3.11,<3.14"
 # build
 maturin = ">=1.5"
 # runtime / API
@@ -33,5 +33,7 @@ hdf5 = ">=1.14"
 
 [tasks]
 cargo-test = "cargo test -p kaichi-core"
-build-py   = "maturin develop --manifest-path kaichi-py/Cargo.toml"
-test-py    = { cmd = "pytest tests/python/", depends-on = ["build-py"] }
+# Use `env -u` to fully drop VIRTUAL_ENV — maturin errors out when both
+# VIRTUAL_ENV and CONDA_PREFIX are set, and pixi exports CONDA_PREFIX.
+build-py   = "env -u VIRTUAL_ENV maturin develop --manifest-path kaichi-py/Cargo.toml"
+test-py    = { cmd = "env -u VIRTUAL_ENV pytest tests/python/", depends-on = ["build-py"] }

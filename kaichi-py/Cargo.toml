@@ -12,4 +12,10 @@ crate-type = ["cdylib"]
 [dependencies]
 kaichi-core = { path = "../kaichi-core" }
 anyhow = { workspace = true }
-# pyo3 and pyo3-arrow added when Python binding work begins
+# Pinned to versions compatible with the workspace's arrow=53. See
+# docs/design/binding-interop.md ("Why we're not on the latest pyo3-arrow").
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
+pyo3-arrow = "0.5"
+numpy = "0.22"
+serde_json = { workspace = true }
+arrow = { workspace = true }
