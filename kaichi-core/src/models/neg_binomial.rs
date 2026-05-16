@@ -450,9 +450,31 @@ mod tests {
         }
     }
 
-    // TODO: test that depth covariate actually affects assignment — same raw count at 2×
-    //       depth should yield lower posterior. All current tests use uniform totals.
-    // TODO: test that n_guides_detected reflects the number of guides above min_confidence per cell.
+    #[test]
+    fn n_guides_detected_counts_guides_above_threshold() {
+        // Cells 0..3 are test subjects (0/1/2/3 guides above threshold). Cells 4..7
+        // are background ballast — NB's overdispersion absorbs more of the signal/bg
+        // gap than Poisson's does, so we need a clear majority of small-count cells
+        // for the EM to place its β0 in the background regime.
+        let mut triples = vec![
+            (0, 0, 1u32), (0, 1, 1), (0, 2, 1),
+            (1, 0, 20),
+            (2, 0, 21), (2, 1, 22),
+            (3, 0, 20), (3, 1, 21), (3, 2, 22),
+        ];
+        for c in 4..8 {
+            for g in 0..3 { triples.push((c, g, 1)); }
+        }
+        let input = make_input_with_totals(8, 3, triples, vec![50; 8]);
+        let model = NegBinomialModel { min_confidence: 0.8, ..Default::default() };
+        let result = model.assign(&input).unwrap();
+        let n_det = result.batch.column_by_name("n_guides_detected").unwrap()
+            .as_any().downcast_ref::<arrow::array::UInt8Array>().unwrap();
+        assert_eq!(n_det.value(0), 0);
+        assert_eq!(n_det.value(1), 1);
+        assert_eq!(n_det.value(2), 2);
+        assert_eq!(n_det.value(3), 3);
+    }
 
     #[test]
     fn trigamma_positive() {
@@ -511,6 +533,23 @@ mod tests {
         let p = fp(0.2, 0.0, 3.0, 5.0);
         assert!(posterior_signal(50.0, 0.0, &p, 0) > 0.99);
         assert!(posterior_signal(0.0, 0.0, &p, 0) < 0.2);
+    }
+
+    #[test]
+    fn nb_posterior_drops_when_depth_doubles() {
+        // Same identity as Poisson: doubling depth (log_d → log_d + ln 2) doubles both
+        // μ_bg and μ_sig, leaving β1 unchanged but growing μ_sig − μ_bg. A fixed y looks
+        // less surprising under the larger background, so the signal posterior falls.
+        let p = fp(0.3, -2.0, 2.0, 1.0);
+        let log_d_lo = (10.0_f64 + 1.0).ln();
+        let log_d_hi = (21.0_f64 + 1.0).ln();
+        let y = 4.0;
+        let post_lo = posterior_signal(y, log_d_lo, &p, 0);
+        let post_hi = posterior_signal(y, log_d_hi, &p, 0);
+        assert!(
+            post_hi < post_lo,
+            "doubling depth should lower posterior at fixed y: lo={post_lo}, hi={post_hi}"
+        );
     }
 
     #[test]
