@@ -160,7 +160,7 @@ file.h5ad
 ├── obs/                        per-cell assignment DataFrame (see data-model.md)
 │   ├── cell_barcode            (string-array, _index)
 │   ├── guide_identity          (string-array)
-│   ├── n_guides_assigned       (int32)
+│   ├── n_guides_detected       (int32)
 │   ├── assignment_confidence   (float32)
 │   ├── is_unassigned           (bool)
 │   └── is_multi_infected       (bool)
@@ -291,10 +291,11 @@ obs/
 ├── attrs: encoding-type     = "dataframe"
 │          encoding-version  = "0.2.0"
 │          _index            = "cell_barcode"
-│          column-order      = ["guide_identity", "n_guides_assigned", ...]
+│          column-order      = ["guide_identity", "assignment_confidence", "n_guides_detected", ...]
 ├── cell_barcode        (string-array  — the index)
 ├── guide_identity      (string-array)
-├── n_guides_assigned   (int32-array)
+├── assignment_confidence (float32-array, NaN for unassigned)
+├── n_guides_detected   (int32-array)
 └── ...
 ```
 
