@@ -3,3 +3,8 @@
 tests/fixtures/
 .claude/
 .pixi/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so

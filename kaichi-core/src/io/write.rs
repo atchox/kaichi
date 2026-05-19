@@ -1,6 +1,6 @@
 use crate::data::{AssignmentResult, LoadedInput};
 use anyhow::{Context, Result};
-use arrow::array::{Array, BooleanArray, StringArray, UInt8Array};
+use arrow::array::{Array, BooleanArray, Float32Array, StringArray, UInt8Array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use hdf5::{types::VarLenUnicode, File, Group, Location};
@@ -63,7 +63,7 @@ fn write_obs(file: &File, input: &LoadedInput, result: &AssignmentResult, n_cell
     write_scalar_str_attr(&obs, "encoding-version", "0.2.0");
     write_scalar_str_attr(&obs, "_index", "_index");
     write_str_arr_attr(&obs, "column-order", &[
-        "guide_identity", "n_guides_detected", "is_unassigned", "is_multi_infected",
+        "guide_identity", "assignment_confidence", "n_guides_detected", "is_unassigned", "is_multi_infected",
     ]);
 
     // /obs/_index — cell barcodes
@@ -100,6 +100,13 @@ fn write_obs(file: &File, input: &LoadedInput, result: &AssignmentResult, n_cell
         .downcast_ref::<UInt8Array>()
         .context("n_guides_detected not UInt8")?;
 
+    let confidence = batch
+        .column_by_name("assignment_confidence")
+        .context("result missing assignment_confidence")?
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .context("assignment_confidence not Float32")?;
+
     // guide_identity: assigned guide ID, or "" for unassigned cells
     let guide_identity: Vec<VarLenUnicode> = (0..n_cells)
         .map(|i| {
@@ -111,6 +118,12 @@ fn write_obs(file: &File, input: &LoadedInput, result: &AssignmentResult, n_cell
         })
         .collect();
     write_array_dataset(&obs, "guide_identity", &Array1::from_vec(guide_identity))?;
+
+    // NaN encodes null (unassigned) — standard anndata convention for missing floats.
+    let conf_arr: Array1<f32> = (0..n_cells)
+        .map(|i| if confidence.is_null(i) { f32::NAN } else { confidence.value(i) })
+        .collect();
+    write_array_dataset(&obs, "assignment_confidence", &conf_arr)?;
 
     let n_det_arr: Array1<i32> = (0..n_cells).map(|i| n_detected.value(i) as i32).collect();
     write_array_dataset(&obs, "n_guides_detected", &n_det_arr)?;
