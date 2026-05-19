@@ -25,13 +25,34 @@ enum Commands {
         /// Output path (.h5ad or .csv)
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Number of worker threads. 0 = half of logical cores.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
     },
+}
+
+/// Resolve the requested thread count. `0` means "half of total logical cores"
+/// (HPC-friendly default); any positive value is honored as-is.
+fn resolve_threads(requested: usize) -> usize {
+    if requested > 0 {
+        return requested;
+    }
+    let total = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    (total / 2).max(1)
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Assign { counts, model, output } => {
+        Commands::Assign { counts, model, output, threads } => {
+            let n_threads = resolve_threads(threads);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n_threads)
+                .build_global()
+                .map_err(|e| anyhow::anyhow!("rayon thread pool init failed: {e}"))?;
+            eprintln!("using {n_threads} thread(s)");
             eprintln!("reading {}", counts.display());
             let t0 = Instant::now();
             let input = kaichi_core::io::read::read_h5ad(&counts)?;

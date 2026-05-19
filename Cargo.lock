@@ -998,6 +998,7 @@ dependencies = [
  "git-version",
  "indicatif",
  "kaichi-core",
+ "rayon",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1030,6 +1031,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "pyo3-arrow",
+ "rayon",
  "serde_json",
 ]
 

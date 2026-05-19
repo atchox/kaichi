@@ -13,6 +13,7 @@ path = "src/main.rs"
 kaichi-core = { path = "../kaichi-core" }
 arrow = { workspace = true }
 anyhow = { workspace = true }
+rayon = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 git-version = "0.3"
 tracing = "0.1"

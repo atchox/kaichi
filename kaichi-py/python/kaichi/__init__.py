@@ -36,6 +36,7 @@ def assign(
     *,
     min_confidence: float | None = None,
     quantile: float | None = None,
+    n_jobs: int | None = None,
 ) -> anndata.AnnData:
     """Run a kaichi guide-assignment model on an h5ad and return an AnnData.
 
@@ -59,6 +60,10 @@ def assign(
         models that don't use one (``umi``, ``max``, ``ratio``, ``quantiles``).
     quantile :
         Top-fraction threshold for the ``quantiles`` model. Ignored otherwise.
+    n_jobs :
+        Rayon worker threads for per-guide EM fitting. ``None`` (default) or
+        ``0`` uses half of the machine's logical cores — HPC-polite. A positive
+        int overrides (e.g. ``n_jobs=os.cpu_count()`` for all cores).
 
     Returns
     -------
@@ -86,6 +91,7 @@ def assign(
         model,
         min_confidence=min_confidence,
         quantile=quantile,
+        n_jobs=n_jobs,
     )
 
     n_cells = len(cell_barcodes)

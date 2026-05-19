@@ -41,13 +41,14 @@ use std::path::Path;
 /// binary `assigned` matrix's `data` array is trivially all-ones and is
 /// reconstructed Python-side rather than shuttled across.
 #[pyfunction]
-#[pyo3(signature = (h5ad_path, model, *, min_confidence=None, quantile=None))]
+#[pyo3(signature = (h5ad_path, model, *, min_confidence=None, quantile=None, n_jobs=None))]
 fn _assign_from_h5ad_inmem<'py>(
     py: Python<'py>,
     h5ad_path: &str,
     model: &str,
     min_confidence: Option<f32>,
     quantile: Option<f32>,
+    n_jobs: Option<usize>,
 ) -> PyResult<(
     PyObject,
     Bound<'py, PyArray1<u32>>,
@@ -63,7 +64,25 @@ fn _assign_from_h5ad_inmem<'py>(
     let input = read_h5ad(Path::new(h5ad_path))
         .map_err(|e| PyIOError::new_err(format!("read_h5ad({h5ad_path}): {e:#}")))?;
 
-    let (result, model_name, model_params_json) = run_model(model, &input, min_confidence, quantile)?;
+    // n_jobs scopes a per-call rayon thread pool. We can't use build_global()
+    // here — Python may call assign() repeatedly within one process, and
+    // build_global() can only fire once. None / 0 → half of total logical
+    // cores (HPC-polite default, matches CLI `--threads 0`).
+    let n_threads = match n_jobs {
+        Some(n) if n > 0 => n,
+        _ => {
+            let total = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            (total / 2).max(1)
+        }
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+        .map_err(|e| PyValueError::new_err(format!("rayon pool init failed: {e}")))?;
+    let (result, model_name, model_params_json) =
+        pool.install(|| run_model(model, &input, min_confidence, quantile))?;
 
     extract(py, input, result, model_name, model_params_json)
 }

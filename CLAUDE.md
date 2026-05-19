@@ -45,9 +45,10 @@ collisions in the workspace. Maturin ignores `[lib] name` and uses
 
 ### kaichi-cli
 `kaichi assign --counts <H5AD> --model <NAME> --output <H5AD|CSV>` works.
+`--threads N` caps rayon's worker pool; unset / 0 = half of total logical
+cores (HPC-polite default, set via `build_global` at startup).
 
 Designed but not yet implemented:
-- `--threads N` (Rayon defaults to all cores — problem on shared HPC nodes)
 - `--params <JSON>` (model param overrides; currently hardcoded defaults)
 - `--seed N`
 - `--guide-library <TSV>`
@@ -57,8 +58,10 @@ Designed but not yet implemented:
 - MEX input
 
 ### kaichi-py
-v0.1 complete. `kaichi.assign(h5ad_path, model)` works end-to-end.
-`n_jobs` / thread control: **not yet exposed**.
+v0.1 complete. `kaichi.assign(h5ad_path, model, n_jobs=N)` works end-to-end.
+`n_jobs` scopes a per-call rayon pool via `pool.install()` (can't use
+`build_global` — Python may call `assign()` multiple times per process).
+Default (None / 0) = half of total logical cores, matching the CLI.
 
 ### kaichi-r
 Stub only — `Cargo.toml` and an empty `lib.rs`. No implementation yet.
@@ -72,13 +75,15 @@ Each guide's fit is independent — embarrassingly parallel.
 
 Not parallelised:
 - Per-cell scoring pass after guide fitting (serial)
-- Thread count not exposed — Rayon defaults to all logical CPUs
+- HDF5 / Arrow write (serial; usually the dominant cost)
+
+Thread count is capped to half of total logical cores by default (HPC-polite);
+override via CLI `--threads N` or Python `n_jobs=N`.
 
 ---
 
 ## Known gaps (priority order)
 
-1. `--threads N` CLI + `n_jobs` Python — needed before HPC use
-2. `--params` CLI flag — no way to override model defaults from the shell
-3. MEX input — CLI design specifies it; currently only H5AD accepted
-4. H5MU output + RNA passthrough — primary output format; currently only H5AD/CSV
+1. `--params` CLI flag — no way to override model defaults from the shell
+2. MEX input — CLI design specifies it; currently only H5AD accepted
+3. H5MU output + RNA passthrough — primary output format; currently only H5AD/CSV
