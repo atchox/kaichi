@@ -1,5 +1,5 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_normal_pdf, logsumexp2, run_em};
+use super::em::{clamp_probability, log_normal_pdf, logsumexp2, run_em, run_em_multistart};
 use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
 
@@ -20,6 +20,7 @@ pub struct GaussModel {
     pub tol: f32,
     pub min_nonzero: u32,
     pub min_max_count: u32,
+    pub n_restarts: u32,
 }
 
 impl Default for GaussModel {
@@ -30,6 +31,7 @@ impl Default for GaussModel {
             tol: 1e-6,
             min_nonzero: 2,
             min_max_count: 2,
+            n_restarts: 5,
         }
     }
 }
@@ -119,6 +121,7 @@ impl AssignmentModel for GaussModel {
             "tol": self.tol,
             "min_nonzero": self.min_nonzero,
             "min_max_count": self.min_max_count,
+            "n_restarts": self.n_restarts,
         })
     }
 }
@@ -138,7 +141,7 @@ impl GaussModel {
             .map(|&c| (c as f64 + 1.0).log10())
             .collect();
 
-        let params = fit_mixture(&log_vals, n_zeros, self.max_em_iters, self.tol as f64);
+        let params = fit_mixture(&log_vals, n_zeros, self.max_em_iters, self.tol as f64, self.n_restarts);
 
         let threshold = (1..=max_count)
             .find(|&c| posterior_signal((c as f64 + 1.0).log10(), params) > self.min_confidence as f64)?;
@@ -155,33 +158,38 @@ impl GaussModel {
 ///
 /// `log_vals`: log10(count + 1) for nonzero UMI observations.
 /// `n_zeros`: cells with zero counts (log10(1) = 0.0), handled analytically.
-fn fit_mixture(log_vals: &[f64], n_zeros: usize, max_em_iters: u32, tol: f64) -> FitParams {
-    let init = initialize_params(log_vals, n_zeros);
-    let mut responsibilities = vec![0.0f64; log_vals.len()];
-
-    run_em(
-        init,
-        |params| {
-            let mut log_lik = 0.0;
-            for (idx, &x) in log_vals.iter().enumerate() {
-                let log_bg = (1.0 - params.pi).ln() + log_normal_pdf(x, params.mu_bg, params.sigma);
-                let log_sig = params.pi.ln() + log_normal_pdf(x, params.mu_signal, params.sigma);
-                let denom = logsumexp2(log_bg, log_sig);
-                responsibilities[idx] = (log_sig - denom).exp();
-                log_lik += denom;
-            }
-            // Zeros: log10(0 + 1) = 0.0; all identical, one shared responsibility.
-            let log_bg_z = (1.0 - params.pi).ln() + log_normal_pdf(0.0, params.mu_bg, params.sigma);
-            let log_sig_z = params.pi.ln() + log_normal_pdf(0.0, params.mu_signal, params.sigma);
-            let denom_z = logsumexp2(log_bg_z, log_sig_z);
-            let r_zero = (log_sig_z - denom_z).exp();
-            log_lik += n_zeros as f64 * denom_z;
-            let new_params = m_step(log_vals, &responsibilities, n_zeros, r_zero);
-            (new_params, log_lik)
-        },
-        max_em_iters,
-        tol,
-    )
+/// Runs `n_restarts` independent EM chains from π values evenly spaced in (0, 0.5),
+/// keeping the result with the highest final log-likelihood.
+fn fit_mixture(log_vals: &[f64], n_zeros: usize, max_em_iters: u32, tol: f64, n_restarts: u32) -> FitParams {
+    let base_init = initialize_params(log_vals, n_zeros);
+    run_em_multistart(n_restarts, |pi_k| {
+        let mut init = base_init;
+        init.pi = pi_k;
+        let mut responsibilities = vec![0.0f64; log_vals.len()];
+        run_em(
+            init,
+            |params| {
+                let mut ll = 0.0;
+                for (idx, &x) in log_vals.iter().enumerate() {
+                    let log_bg = (1.0 - params.pi).ln() + log_normal_pdf(x, params.mu_bg, params.sigma);
+                    let log_sig = params.pi.ln() + log_normal_pdf(x, params.mu_signal, params.sigma);
+                    let denom = logsumexp2(log_bg, log_sig);
+                    responsibilities[idx] = (log_sig - denom).exp();
+                    ll += denom;
+                }
+                // Zeros: log10(0 + 1) = 0.0; all identical, one shared responsibility.
+                let log_bg_z = (1.0 - params.pi).ln() + log_normal_pdf(0.0, params.mu_bg, params.sigma);
+                let log_sig_z = params.pi.ln() + log_normal_pdf(0.0, params.mu_signal, params.sigma);
+                let denom_z = logsumexp2(log_bg_z, log_sig_z);
+                let r_zero = (log_sig_z - denom_z).exp();
+                ll += n_zeros as f64 * denom_z;
+                let new_params = m_step(log_vals, &responsibilities, n_zeros, r_zero);
+                (new_params, ll)
+            },
+            max_em_iters,
+            tol,
+        )
+    })
 }
 
 fn initialize_params(log_vals: &[f64], n_zeros: usize) -> FitParams {
@@ -489,7 +497,7 @@ mod tests {
         let bg: Vec<f64> = (0..15).map(|_| 0.301).collect(); // log10(2)
         let sig: Vec<f64> = vec![1.408, 1.431, 1.415, 1.447, 1.380]; // log10(25..30)
         let all: Vec<f64> = bg.into_iter().chain(sig).collect();
-        let params = fit_mixture(&all, 100, 100, 1e-8);
+        let params = fit_mixture(&all, 100, 100, 1e-8, 5);
         assert!(
             params.mu_signal > params.mu_bg,
             "mu_signal ({}) should exceed mu_bg ({})",
@@ -503,7 +511,7 @@ mod tests {
         // and known-signal log10 values. Signal posterior must be high at count 25,
         // low at count 1.
         let nonzero: Vec<f64> = vec![0.301, 0.322, 0.342, 1.408, 1.431, 1.447, 1.462];
-        let params = fit_mixture(&nonzero, 50, 100, 1e-8);
+        let params = fit_mixture(&nonzero, 50, 100, 1e-8, 5);
         let p_high = posterior_signal((25.0_f64 + 1.0).log10(), params);
         let p_low = posterior_signal((1.0_f64 + 1.0).log10(), params);
         assert!(p_high > 0.9, "posterior at signal level should be > 0.9, got {p_high}");
@@ -528,8 +536,8 @@ mod tests {
     fn zeros_included_in_background_estimate() {
         // More zeros should pull mu_bg toward 0 (log10(1) = 0.0) and lower sigma.
         let nonzero: Vec<f64> = vec![0.301, 0.322, 1.408, 1.431, 1.447];
-        let params_few = fit_mixture(&nonzero, 5, 100, 1e-8);
-        let params_many = fit_mixture(&nonzero, 1000, 100, 1e-8);
+        let params_few = fit_mixture(&nonzero, 5, 100, 1e-8, 5);
+        let params_many = fit_mixture(&nonzero, 1000, 100, 1e-8, 5);
         assert!(
             params_many.mu_bg <= params_few.mu_bg + 0.05,
             "more zeros should pull mu_bg toward 0"

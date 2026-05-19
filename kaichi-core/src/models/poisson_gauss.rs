@@ -1,5 +1,5 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_normal_pdf, log_poisson_pmf, logsumexp2, run_em};
+use super::em::{clamp_probability, log_normal_pdf, log_poisson_pmf, logsumexp2, run_em, run_em_multistart};
 use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
 
@@ -20,6 +20,7 @@ pub struct PoissonGaussModel {
     pub tol: f32,
     pub min_nonzero: u32,
     pub min_max_count: u32,
+    pub n_restarts: u32,
 }
 
 impl Default for PoissonGaussModel {
@@ -30,6 +31,7 @@ impl Default for PoissonGaussModel {
             tol: 1e-6,
             min_nonzero: 2,
             min_max_count: 2,
+            n_restarts: 5,
         }
     }
 }
@@ -120,6 +122,7 @@ impl AssignmentModel for PoissonGaussModel {
             "tol": self.tol,
             "min_nonzero": self.min_nonzero,
             "min_max_count": self.min_max_count,
+            "n_restarts": self.n_restarts,
         })
     }
 }
@@ -144,7 +147,7 @@ impl PoissonGaussModel {
             .map(|&c| c as f64)
             .collect();
 
-        let params = fit_mixture(&raw_counts, n_zeros, self.max_em_iters, self.tol as f64);
+        let params = fit_mixture(&raw_counts, n_zeros, self.max_em_iters, self.tol as f64, self.n_restarts);
 
         let threshold = (1..=max_count)
             .find(|&c| posterior_signal(c as f64, params) > self.min_confidence as f64)?;
@@ -162,27 +165,37 @@ impl PoissonGaussModel {
 /// `nonzero_vals`: non-zero UMI counts as f64.
 /// `n_zeros`: number of cells with zero counts for this guide, included
 ///            analytically so zeros don't need to be materialised.
-fn fit_mixture(nonzero_vals: &[f64], n_zeros: usize, max_em_iters: u32, tol: f64) -> FitParams {
-    let init = initialize_params(nonzero_vals, n_zeros);
-    let mut responsibilities = vec![0.0f64; nonzero_vals.len()];
-
-    run_em(init, |params| {
-        let mut log_lik = 0.0;
-        for (idx, &x) in nonzero_vals.iter().enumerate() {
-            let log_bg = (1.0 - params.pi).ln() + log_poisson_pmf(x, params.lambda_bg);
-            let log_sig = params.pi.ln() + log_normal_pdf(x, params.mu_signal, params.sigma_signal);
-            let denom = logsumexp2(log_bg, log_sig);
-            responsibilities[idx] = (log_sig - denom).exp();
-            log_lik += denom;
-        }
-        let log_bg_zero = (1.0 - params.pi).ln() + log_poisson_pmf(0.0, params.lambda_bg);
-        let log_sig_zero = params.pi.ln() + log_normal_pdf(0.0, params.mu_signal, params.sigma_signal);
-        let denom_zero = logsumexp2(log_bg_zero, log_sig_zero);
-        let r_zero = (log_sig_zero - denom_zero).exp();
-        log_lik += n_zeros as f64 * denom_zero;
-        let new_params = m_step(nonzero_vals, &responsibilities, n_zeros, r_zero);
-        (new_params, log_lik)
-    }, max_em_iters, tol)
+/// Runs `n_restarts` independent EM chains from π values evenly spaced in (0, 0.5),
+/// keeping the result with the highest final log-likelihood.
+fn fit_mixture(nonzero_vals: &[f64], n_zeros: usize, max_em_iters: u32, tol: f64, n_restarts: u32) -> FitParams {
+    let base_init = initialize_params(nonzero_vals, n_zeros);
+    run_em_multistart(n_restarts, |pi_k| {
+        let mut init = base_init;
+        init.pi = pi_k;
+        let mut responsibilities = vec![0.0f64; nonzero_vals.len()];
+        run_em(
+            init,
+            |params| {
+                let mut ll = 0.0;
+                for (idx, &x) in nonzero_vals.iter().enumerate() {
+                    let log_bg = (1.0 - params.pi).ln() + log_poisson_pmf(x, params.lambda_bg);
+                    let log_sig = params.pi.ln() + log_normal_pdf(x, params.mu_signal, params.sigma_signal);
+                    let denom = logsumexp2(log_bg, log_sig);
+                    responsibilities[idx] = (log_sig - denom).exp();
+                    ll += denom;
+                }
+                let log_bg_zero = (1.0 - params.pi).ln() + log_poisson_pmf(0.0, params.lambda_bg);
+                let log_sig_zero = params.pi.ln() + log_normal_pdf(0.0, params.mu_signal, params.sigma_signal);
+                let denom_zero = logsumexp2(log_bg_zero, log_sig_zero);
+                let r_zero = (log_sig_zero - denom_zero).exp();
+                ll += n_zeros as f64 * denom_zero;
+                let new_params = m_step(nonzero_vals, &responsibilities, n_zeros, r_zero);
+                (new_params, ll)
+            },
+            max_em_iters,
+            tol,
+        )
+    })
 }
 
 fn initialize_params(nonzero_vals: &[f64], n_zeros: usize) -> FitParams {
@@ -515,7 +528,7 @@ mod tests {
         let nonzero: Vec<f64> = (0..20)
             .map(|i| if i < 15 { 1.0 + i as f64 * 0.1 } else { 20.0 + (i - 15) as f64 * 2.0 })
             .collect();
-        let params = fit_mixture(&nonzero, 100, 100, 1e-8);
+        let params = fit_mixture(&nonzero, 100, 100, 1e-8, 5);
         assert!(
             params.mu_signal > params.lambda_bg,
             "mu_signal ({}) should exceed lambda_bg ({})",
@@ -529,7 +542,7 @@ mod tests {
         // and known-signal counts. The mixture should assign > 0.9 to signal at 25 UMIs
         // and < 0.1 to signal at 1 UMI.
         let nonzero: Vec<f64> = vec![1.0, 1.5, 2.0, 20.0, 22.0, 25.0, 28.0];
-        let params = fit_mixture(&nonzero, 50, 100, 1e-8);
+        let params = fit_mixture(&nonzero, 50, 100, 1e-8, 5);
         let p_high = posterior_signal(25.0, params);
         let p_low = posterior_signal(1.0, params);
         assert!(p_high > 0.9, "posterior at signal level should be > 0.9, got {p_high}");
@@ -557,8 +570,8 @@ mod tests {
         // MLE for lambda_bg. A guide with 1000 zero-count cells should yield a much
         // smaller lambda_bg than the same nonzero counts with only 5 zero cells.
         let nonzero: Vec<f64> = vec![1.0, 2.0, 25.0, 28.0, 30.0];
-        let params_few_zeros = fit_mixture(&nonzero, 5, 100, 1e-8);
-        let params_many_zeros = fit_mixture(&nonzero, 1000, 100, 1e-8);
+        let params_few_zeros = fit_mixture(&nonzero, 5, 100, 1e-8, 5);
+        let params_many_zeros = fit_mixture(&nonzero, 1000, 100, 1e-8, 5);
         assert!(
             params_many_zeros.lambda_bg < params_few_zeros.lambda_bg,
             "more zeros should pull lambda_bg down"

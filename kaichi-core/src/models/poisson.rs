@@ -1,5 +1,5 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_poisson_pmf, logsumexp2, run_em};
+use super::em::{clamp_probability, log_poisson_pmf, logsumexp2, run_em, run_em_multistart};
 use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
 
@@ -19,6 +19,7 @@ pub struct PoissonModel {
     pub tol: f32,
     pub min_nonzero: u32,
     pub min_max_count: u32,
+    pub n_restarts: u32,
 }
 
 impl Default for PoissonModel {
@@ -30,6 +31,7 @@ impl Default for PoissonModel {
             tol: 1e-6,
             min_nonzero: 2,
             min_max_count: 2,
+            n_restarts: 5,
         }
     }
 }
@@ -134,6 +136,7 @@ impl AssignmentModel for PoissonModel {
             "tol": self.tol,
             "min_nonzero": self.min_nonzero,
             "min_max_count": self.min_max_count,
+            "n_restarts": self.n_restarts,
         })
     }
 }
@@ -145,7 +148,7 @@ impl PoissonModel {
         if n_nonzero < self.min_nonzero || max_count < self.min_max_count {
             return None;
         }
-        Some(fit_mixture(data, n_batches, self.max_em_iters, self.inner_max_iters, self.tol as f64))
+        Some(fit_mixture(data, n_batches, self.max_em_iters, self.inner_max_iters, self.tol as f64, self.n_restarts))
     }
 }
 
@@ -159,30 +162,34 @@ fn fit_mixture(
     max_em_iters: u32,
     inner_max_iters: u32,
     tol: f64,
+    n_restarts: u32,
 ) -> FitParams {
-    let init = initialize_params(data, n_batches);
-    let mut responsibilities = vec![0.0f64; data.len()];
-
-    run_em(
-        init,
-        |params| {
-            let mut log_lik = 0.0;
-            for (idx, &(y, log_d, b)) in data.iter().enumerate() {
-                let gb = params.gamma[b as usize];
-                let mu0 = (params.beta0 + gb + log_d).exp();
-                let mu1 = (params.beta0 + params.beta1 + gb + log_d).exp();
-                let log_bg = (1.0 - params.pi).ln() + log_poisson_pmf(y, mu0);
-                let log_sig = params.pi.ln() + log_poisson_pmf(y, mu1);
-                let denom = logsumexp2(log_bg, log_sig);
-                responsibilities[idx] = (log_sig - denom).exp();
-                log_lik += denom;
-            }
-            let new_params = m_step(params, data, &responsibilities, inner_max_iters);
-            (new_params, log_lik)
-        },
-        max_em_iters,
-        tol,
-    )
+    let base_init = initialize_params(data, n_batches);
+    run_em_multistart(n_restarts, |pi_k| {
+        let mut init = base_init.clone();
+        init.pi = pi_k;
+        let mut responsibilities = vec![0.0f64; data.len()];
+        run_em(
+            init,
+            |params| {
+                let mut ll = 0.0;
+                for (idx, &(y, log_d, b)) in data.iter().enumerate() {
+                    let gb = params.gamma[b as usize];
+                    let mu0 = (params.beta0 + gb + log_d).exp();
+                    let mu1 = (params.beta0 + params.beta1 + gb + log_d).exp();
+                    let log_bg = (1.0 - params.pi).ln() + log_poisson_pmf(y, mu0);
+                    let log_sig = params.pi.ln() + log_poisson_pmf(y, mu1);
+                    let denom = logsumexp2(log_bg, log_sig);
+                    responsibilities[idx] = (log_sig - denom).exp();
+                    ll += denom;
+                }
+                let new_params = m_step(params, data, &responsibilities, inner_max_iters);
+                (new_params, ll)
+            },
+            max_em_iters,
+            tol,
+        )
+    })
 }
 
 fn initialize_params(data: &[(f64, f64, u16)], n_batches: usize) -> FitParams {
@@ -511,7 +518,7 @@ mod tests {
         let mut data: Vec<(f64, f64, u16)> = (0..12).map(|i| ((i % 3) as f64, log_d, 0u16)).collect();
         data.extend((0..8).map(|i| (18.0 + i as f64, log_d, 0u16)));
 
-        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8);
+        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8, 5);
         let mu_bg = (fitted.beta0 + log_d).exp();
         let mu_sig = (fitted.beta0 + fitted.beta1 + log_d).exp();
 
@@ -538,7 +545,7 @@ mod tests {
         for i in 0..10 { data.push(((i % 2 + 4) as f64, log_d, 1u16)); }       // y = 4 or 5
         for i in 0..6  { data.push((75.0 + i as f64, log_d, 1u16)); }          // y ≈ 80
 
-        let fitted = fit_mixture(&data, 2, 200, 50, 1e-8);
+        let fitted = fit_mixture(&data, 2, 200, 50, 1e-8, 5);
         assert!(fitted.gamma[0] == 0.0, "γ_0 anchored");
         // Truth γ_1 = ln(4) ≈ 1.386; with this synthetic data the EM lands near 1.307.
         // 0.15 window catches a 2× drift from the current fit while remaining tight enough

@@ -154,6 +154,30 @@ Poisson, Poisson-Gauss, and Binomial families). This removes the truncated-likel
 bias from crispat's `λ`/`p` estimates without materializing the zero observations. See
 [poisson_gauss.rs](../../kaichi-core/src/models/poisson_gauss.rs) for the pattern.
 
+**Multi-restart initialization**: EM is a local optimizer — for 2-component mixtures
+with weak or ambiguous signal it can fall into:
+
+- **π collapse**: EM converges to π → 0, declaring no cells infected (common when the
+  init's π is too low and the signal component "vanishes" before it stabilizes).
+- **Label switching**: signal and background components swap during fitting, and the
+  post-fit relabeling rescues the wrong basin.
+- **Saddle-point stalls**: ambiguous data with overlapping signal / background ranges
+  has multiple comparable local optima.
+
+To approximate the global optimum, each guide's EM is run from `n_restarts`
+initializations that vary the mixing weight π across a fixed grid in `(0, 0.5)`
+(values above 0.5 are biologically implausible for Perturb-seq infection rates).
+The other parameters (`λ_bg`, `μ_signal`, batch offsets, …) use the existing
+data-driven init for each restart. The restart with the highest final log-likelihood
+is kept; all others are discarded.
+
+This is pure MLE — no priors, no double-dipping. The `assignment_confidence`
+posterior remains a properly calibrated mixture posterior under the chosen model;
+restarts only improve the optimization. Default `n_restarts = 5`. Per-guide EM
+work scales linearly with `n_restarts`, but each guide's total fit is still
+sub-millisecond at typical Perturb-seq sizes, so the user-visible cost is
+negligible.
+
 ---
 
 ## Model: `gauss`
@@ -184,6 +208,7 @@ modeled separately.
 ```
 min_confidence  Float32   default: 0.8     posterior P(z=1) threshold for assignment
 max_em_iters    UInt32    default: 100
+n_restarts      UInt32    default: 5       see "Multi-restart initialization" above
 tol             Float32   default: 1e-6
 min_nonzero     UInt32    default: 2
 min_max_count   UInt32    default: 2
@@ -248,6 +273,7 @@ for the analytic-zero pattern.
 ```
 min_confidence  Float32  default: 0.5
 max_em_iters    UInt32   default: 100
+n_restarts      UInt32   default: 5       see "Multi-restart initialization" above
 tol             Float32  default: 1e-6
 min_nonzero     UInt32   default: 2
 min_max_count   UInt32   default: 2
@@ -309,6 +335,7 @@ not a parameter).
 min_confidence  Float32   default: 0.8
 max_em_iters    UInt32    default: 100
 inner_max_iters UInt32    default: 25     Newton-Raphson on β,γ per M-step
+n_restarts      UInt32    default: 5      see "Multi-restart initialization" above
 tol             Float32   default: 1e-6
 min_nonzero     UInt32    default: 2
 min_max_count   UInt32    default: 2
@@ -383,6 +410,7 @@ the NB collapses to Poisson; smaller `θ` means more overdispersion.
 min_confidence  Float32   default: 0.8
 max_em_iters    UInt32    default: 100
 inner_max_iters UInt32    default: 25
+n_restarts      UInt32    default: 5       see "Multi-restart initialization" above
 tol             Float32   default: 1e-6
 min_nonzero     UInt32    default: 2
 min_max_count   UInt32    default: 2
@@ -453,6 +481,7 @@ per-cell **total guide UMIs**, not the total RNA — this is what crispat passes
 min_confidence  Float32   default: 0.8     posterior threshold for assignment
 max_em_iters    UInt32    default: 100
 inner_max_iters UInt32    default: 25
+n_restarts      UInt32    default: 5       see "Multi-restart initialization" above
 tol             Float32   default: 1e-6
 min_nonzero     UInt32    default: 2
 min_max_count   UInt32    default: 2
@@ -511,6 +540,7 @@ the background has mean closer to `1/G` (counts spread across many guides).
 ```
 min_confidence  Float32  default: 0.5     posterior threshold
 max_em_iters    UInt32   default: 200
+n_restarts      UInt32   default: 5       see "Multi-restart initialization" above
 tol             Float32  default: 1e-6
 clamp_lo        Float32  default: 1e-4    Beta is undefined at 0
 clamp_hi        Float32  default: 1-1e-4

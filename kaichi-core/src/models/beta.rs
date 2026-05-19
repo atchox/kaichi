@@ -1,5 +1,5 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_beta_pdf, logsumexp2, run_em};
+use super::em::{clamp_probability, log_beta_pdf, logsumexp2, run_em, run_em_multistart};
 use super::output::AssignmentOutputBuilder;
 use crate::data::{AssignmentResult, LoadedInput};
 
@@ -21,6 +21,7 @@ pub struct Beta2Model {
     pub tol: f32,
     pub clamp_lo: f32,
     pub clamp_hi: f32,
+    pub n_restarts: u32,
 }
 
 impl Default for Beta2Model {
@@ -31,6 +32,7 @@ impl Default for Beta2Model {
             tol: 1e-6,
             clamp_lo: 1e-4,
             clamp_hi: 1.0 - 1e-4,
+            n_restarts: 5,
         }
     }
 }
@@ -49,6 +51,7 @@ pub struct Beta3Model {
     pub tol: f32,
     pub clamp_lo: f32,
     pub clamp_hi: f32,
+    pub n_restarts: u32,
 }
 
 impl Default for Beta3Model {
@@ -59,6 +62,7 @@ impl Default for Beta3Model {
             tol: 1e-6,
             clamp_lo: 1e-4,
             clamp_hi: 1.0 - 1e-4,
+            n_restarts: 5,
         }
     }
 }
@@ -108,7 +112,7 @@ impl AssignmentModel for Beta2Model {
             let batch_props: Vec<f64> = cells.iter()
                 .filter_map(|&i| if props[i].0 > 0.0 { Some(props[i].0) } else { None })
                 .collect();
-            fit_beta2(&batch_props, self.max_em_iters, self.tol as f64)
+            fit_beta2(&batch_props, self.max_em_iters, self.tol as f64, self.n_restarts)
         }).collect();
 
         let guide_ids_arr = &input.guide_metadata.guide_ids;
@@ -141,6 +145,7 @@ impl AssignmentModel for Beta2Model {
             "tol": self.tol,
             "clamp_lo": self.clamp_lo,
             "clamp_hi": self.clamp_hi,
+            "n_restarts": self.n_restarts,
         })
     }
 }
@@ -165,7 +170,7 @@ impl AssignmentModel for Beta3Model {
             let batch_props: Vec<f64> = cells.iter()
                 .filter_map(|&i| if props[i].0 > 0.0 { Some(props[i].0) } else { None })
                 .collect();
-            fit_beta3(&batch_props, self.max_em_iters, self.tol as f64)
+            fit_beta3(&batch_props, self.max_em_iters, self.tol as f64, self.n_restarts)
         }).collect();
 
         let guide_ids_arr = &input.guide_metadata.guide_ids;
@@ -199,6 +204,7 @@ impl AssignmentModel for Beta3Model {
             "tol": self.tol,
             "clamp_lo": self.clamp_lo,
             "clamp_hi": self.clamp_hi,
+            "n_restarts": self.n_restarts,
         })
     }
 }
@@ -244,30 +250,32 @@ fn max_proportions(
 // Beta2 EM
 // ---------------------------------------------------------------------------
 
-fn fit_beta2(props: &[f64], max_em_iters: u32, tol: f64) -> Beta2Params {
-    let init = Beta2Params { pi: 0.4, al: 1.0, bl: 10.0, ah: 10.0, bh: 1.0 };
+fn fit_beta2(props: &[f64], max_em_iters: u32, tol: f64, n_restarts: u32) -> Beta2Params {
+    let base = Beta2Params { pi: 0.4, al: 1.0, bl: 10.0, ah: 10.0, bh: 1.0 };
     if props.is_empty() {
-        return init;
+        return base;
     }
-    let mut r_h = vec![0.0f64; props.len()];
-
-    run_em(
-        init,
-        |params| {
-            let mut log_lik = 0.0;
-            for (idx, &x) in props.iter().enumerate() {
-                let log_l = (1.0 - params.pi).ln() + log_beta_pdf(x, params.al, params.bl);
-                let log_h = params.pi.ln() + log_beta_pdf(x, params.ah, params.bh);
-                let denom = logsumexp2(log_l, log_h);
-                r_h[idx] = (log_h - denom).exp();
-                log_lik += denom;
-            }
-            let new_params = m_step_beta2(params, props, &r_h);
-            (new_params, log_lik)
-        },
-        max_em_iters,
-        tol,
-    )
+    run_em_multistart(n_restarts, |pi_k| {
+        let init = Beta2Params { pi: pi_k, ..base };
+        let mut r_h = vec![0.0f64; props.len()];
+        run_em(
+            init,
+            |params| {
+                let mut ll = 0.0;
+                for (idx, &x) in props.iter().enumerate() {
+                    let log_l = (1.0 - params.pi).ln() + log_beta_pdf(x, params.al, params.bl);
+                    let log_h = params.pi.ln() + log_beta_pdf(x, params.ah, params.bh);
+                    let denom = logsumexp2(log_l, log_h);
+                    r_h[idx] = (log_h - denom).exp();
+                    ll += denom;
+                }
+                let new_params = m_step_beta2(params, props, &r_h);
+                (new_params, ll)
+            },
+            max_em_iters,
+            tol,
+        )
+    })
 }
 
 fn m_step_beta2(_params: Beta2Params, props: &[f64], r_h: &[f64]) -> Beta2Params {
@@ -300,41 +308,45 @@ fn posterior_high_2(x: f64, params: Beta2Params) -> f64 {
 // Beta3 EM
 // ---------------------------------------------------------------------------
 
-fn fit_beta3(props: &[f64], max_em_iters: u32, tol: f64) -> Beta3Params {
-    let init = Beta3Params {
+fn fit_beta3(props: &[f64], max_em_iters: u32, tol: f64, n_restarts: u32) -> Beta3Params {
+    let base = Beta3Params {
         pi_l: 0.4, pi_m: 0.3, pi_h: 0.3,
         al: 1.0, bl: 10.0,
         am: 10.0, bm: 10.0,
         ah: 10.0, bh: 1.0,
     };
     if props.is_empty() {
-        return init;
+        return base;
     }
     let n = props.len();
-    let mut r = vec![[0.0f64; 3]; n]; // [r_l, r_m, r_h]
-
-    run_em(
-        init,
-        |params| {
-            let mut log_lik = 0.0;
-            for (idx, &x) in props.iter().enumerate() {
-                let ll = params.pi_l.ln() + log_beta_pdf(x, params.al, params.bl);
-                let lm = params.pi_m.ln() + log_beta_pdf(x, params.am, params.bm);
-                let lh = params.pi_h.ln() + log_beta_pdf(x, params.ah, params.bh);
-                let max = ll.max(lm).max(lh);
-                let sum_exp = (ll - max).exp() + (lm - max).exp() + (lh - max).exp();
-                let denom = max + sum_exp.ln();
-                r[idx][0] = (ll - denom).exp();
-                r[idx][1] = (lm - denom).exp();
-                r[idx][2] = (lh - denom).exp();
-                log_lik += denom;
-            }
-            let new_params = m_step_beta3(params, props, &r);
-            (new_params, log_lik)
-        },
-        max_em_iters,
-        tol,
-    )
+    run_em_multistart(n_restarts, |pi_k| {
+        // The multistart grid drives pi_h; remaining mass splits evenly between l/m.
+        let pi_rest = (1.0 - pi_k) / 2.0;
+        let init = Beta3Params { pi_h: pi_k, pi_l: pi_rest, pi_m: pi_rest, ..base };
+        let mut r = vec![[0.0f64; 3]; n];
+        run_em(
+            init,
+            |params| {
+                let mut ll = 0.0;
+                for (idx, &x) in props.iter().enumerate() {
+                    let log_l = params.pi_l.ln() + log_beta_pdf(x, params.al, params.bl);
+                    let log_m = params.pi_m.ln() + log_beta_pdf(x, params.am, params.bm);
+                    let log_h = params.pi_h.ln() + log_beta_pdf(x, params.ah, params.bh);
+                    let max = log_l.max(log_m).max(log_h);
+                    let sum_exp = (log_l - max).exp() + (log_m - max).exp() + (log_h - max).exp();
+                    let denom = max + sum_exp.ln();
+                    r[idx][0] = (log_l - denom).exp();
+                    r[idx][1] = (log_m - denom).exp();
+                    r[idx][2] = (log_h - denom).exp();
+                    ll += denom;
+                }
+                let new_params = m_step_beta3(params, props, &r);
+                (new_params, ll)
+            },
+            max_em_iters,
+            tol,
+        )
+    })
 }
 
 fn m_step_beta3(_params: Beta3Params, props: &[f64], r: &[[f64; 3]]) -> Beta3Params {
@@ -844,7 +856,7 @@ mod tests {
         // Clamp away from the boundaries the model expects.
         for x in &mut data { *x = x.clamp(1e-4, 1.0 - 1e-4); }
 
-        let fitted = fit_beta2(&data, 500, 1e-8);
+        let fitted = fit_beta2(&data, 500, 1e-8, 5);
         let mean_h = fitted.ah / (fitted.ah + fitted.bh);
         let mean_l = fitted.al / (fitted.al + fitted.bl);
 

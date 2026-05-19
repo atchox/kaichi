@@ -1,5 +1,5 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_nb_pmf, logsumexp2, run_em};
+use super::em::{clamp_probability, log_nb_pmf, logsumexp2, run_em, run_em_multistart};
 use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
 
@@ -23,6 +23,7 @@ pub struct NegBinomialModel {
     pub theta_init: f32,
     pub theta_min: f32,
     pub theta_max: f32,
+    pub n_restarts: u32,
 }
 
 impl Default for NegBinomialModel {
@@ -37,6 +38,7 @@ impl Default for NegBinomialModel {
             theta_init: 5.0,
             theta_min: 0.01,
             theta_max: 1e4,
+            n_restarts: 5,
         }
     }
 }
@@ -147,6 +149,7 @@ impl AssignmentModel for NegBinomialModel {
             "theta_init": self.theta_init,
             "theta_min": self.theta_min,
             "theta_max": self.theta_max,
+            "n_restarts": self.n_restarts,
         })
     }
 }
@@ -167,6 +170,7 @@ impl NegBinomialModel {
             (self.theta_init as f64).ln(),
             theta_log_min,
             theta_log_max,
+            self.n_restarts,
         ))
     }
 }
@@ -184,34 +188,38 @@ fn fit_mixture(
     log_theta_init: f64,
     log_theta_min: f64,
     log_theta_max: f64,
+    n_restarts: u32,
 ) -> FitParams {
-    let init = initialize_params(data, n_batches, log_theta_init);
-    let mut responsibilities = vec![0.0f64; data.len()];
-
-    run_em(
-        init,
-        |params| {
-            let theta = params.log_theta.exp();
-            let mut log_lik = 0.0;
-            for (idx, &(y, log_d, b)) in data.iter().enumerate() {
-                let gb = params.gamma[b as usize];
-                let mu0 = (params.beta0 + gb + log_d).exp();
-                let mu1 = (params.beta0 + params.beta1 + gb + log_d).exp();
-                let log_bg = (1.0 - params.pi).ln() + log_nb_pmf(y, mu0, theta);
-                let log_sig = params.pi.ln() + log_nb_pmf(y, mu1, theta);
-                let denom = logsumexp2(log_bg, log_sig);
-                responsibilities[idx] = (log_sig - denom).exp();
-                log_lik += denom;
-            }
-            let new_params = m_step(
-                params, data, &responsibilities, inner_max_iters,
-                log_theta_min, log_theta_max,
-            );
-            (new_params, log_lik)
-        },
-        max_em_iters,
-        tol,
-    )
+    let base_init = initialize_params(data, n_batches, log_theta_init);
+    run_em_multistart(n_restarts, |pi_k| {
+        let mut init = base_init.clone();
+        init.pi = pi_k;
+        let mut responsibilities = vec![0.0f64; data.len()];
+        run_em(
+            init,
+            |params| {
+                let theta = params.log_theta.exp();
+                let mut ll = 0.0;
+                for (idx, &(y, log_d, b)) in data.iter().enumerate() {
+                    let gb = params.gamma[b as usize];
+                    let mu0 = (params.beta0 + gb + log_d).exp();
+                    let mu1 = (params.beta0 + params.beta1 + gb + log_d).exp();
+                    let log_bg = (1.0 - params.pi).ln() + log_nb_pmf(y, mu0, theta);
+                    let log_sig = params.pi.ln() + log_nb_pmf(y, mu1, theta);
+                    let denom = logsumexp2(log_bg, log_sig);
+                    responsibilities[idx] = (log_sig - denom).exp();
+                    ll += denom;
+                }
+                let new_params = m_step(
+                    params, data, &responsibilities, inner_max_iters,
+                    log_theta_min, log_theta_max,
+                );
+                (new_params, ll)
+            },
+            max_em_iters,
+            tol,
+        )
+    })
 }
 
 fn initialize_params(data: &[(f64, f64, u16)], n_batches: usize, log_theta_init: f64) -> FitParams {
@@ -573,7 +581,7 @@ mod tests {
 
         let fitted = fit_mixture(
             &data, 1, 200, 25, 1e-8,
-            5.0_f64.ln(), 0.01_f64.ln(), 1e4_f64.ln(),
+            5.0_f64.ln(), 0.01_f64.ln(), 1e4_f64.ln(), 5,
         );
 
         let mu_bg = (fitted.beta0 + log_d).exp();
@@ -594,7 +602,7 @@ mod tests {
             .map(|y| (y, log_d, 0u16))
             .collect();
         let cap_log = 3.0;
-        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8, 1.0, -4.0, cap_log);
+        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8, 1.0, -4.0, cap_log, 5);
         assert!(
             fitted.log_theta <= cap_log + 1e-9,
             "log_theta {} exceeded cap {cap_log}", fitted.log_theta
@@ -614,7 +622,7 @@ mod tests {
 
         let fitted = fit_mixture(
             &data, 2, 200, 50, 1e-8,
-            5.0_f64.ln(), 0.01_f64.ln(), 1e4_f64.ln(),
+            5.0_f64.ln(), 0.01_f64.ln(), 1e4_f64.ln(), 5,
         );
         assert_eq!(fitted.gamma[0], 0.0);
         // Truth γ_1 = ln(4) ≈ 1.386; the EM lands near 1.307 here. Same tolerance as Poisson.

@@ -65,12 +65,39 @@ pub fn solve_2x2_sym(h: [f64; 3], g: [f64; 2]) -> Option<[f64; 2]> {
     Some([(h[2] * g[0] - h[1] * g[1]) / det, (-h[1] * g[0] + h[0] * g[1]) / det])
 }
 
+/// Run EM from multiple π initialisations and return the params with the highest
+/// final log-likelihood.
+///
+/// `do_restart(pi_k)` is called for each restart with a π value drawn from a grid
+/// of `n_restarts` evenly-spaced points in the open interval (0, 0.5) —
+/// biologically plausible infection rates. The closure is expected to override
+/// `pi` on a data-driven base init, allocate per-restart buffers, and call
+/// `run_em` to convergence; it returns `(params, log_lik)`. `n_restarts == 0`
+/// is treated as 1 (single deterministic run).
+pub fn run_em_multistart<P, F>(n_restarts: u32, mut do_restart: F) -> P
+where
+    F: FnMut(f64) -> (P, f64),
+{
+    let n = n_restarts.max(1);
+    let mut best: Option<(P, f64)> = None;
+    for k in 0..n {
+        let pi_k = (k as f64 + 1.0) / (n as f64 + 1.0) * 0.5;
+        let (params, log_lik) = do_restart(pi_k);
+        if best.as_ref().map_or(true, |(_, ll)| log_lik > *ll) {
+            best = Some((params, log_lik));
+        }
+    }
+    best.unwrap().0
+}
+
 /// Drive an EM loop to convergence.
 ///
 /// `step(params)` must perform one full E→M cycle and return `(new_params, log_lik)`.
 /// Convergence is declared when the relative change in log-likelihood falls below `tol`.
 /// `step` is `FnMut` so the closure can update pre-allocated responsibility buffers.
-pub fn run_em<P, F>(init: P, mut step: F, max_iters: u32, tol: f64) -> P
+///
+/// Returns `(params, log_lik)` at convergence or iteration limit.
+pub fn run_em<P, F>(init: P, mut step: F, max_iters: u32, tol: f64) -> (P, f64)
 where
     F: FnMut(P) -> (P, f64),
 {
@@ -81,13 +108,13 @@ where
         if last_log_lik.is_finite() {
             let scale = last_log_lik.abs().max(1.0);
             if (log_lik - last_log_lik).abs() / scale < tol {
-                return new_params;
+                return (new_params, log_lik);
             }
         }
         last_log_lik = log_lik;
         params = new_params;
     }
-    params
+    (params, last_log_lik)
 }
 
 #[cfg(test)]
@@ -112,7 +139,7 @@ mod tests {
     #[test]
     fn run_em_converges() {
         // Step always returns log_lik = 0.0; second iteration sees no change → converge.
-        let result = run_em(0.5f64, |p| (p, 0.0), 100, 1e-6);
+        let (result, _) = run_em(0.5f64, |p| (p, 0.0), 100, 1e-6);
         assert!(result.is_finite());
     }
 

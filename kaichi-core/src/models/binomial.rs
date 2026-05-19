@@ -1,5 +1,5 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_binom_pmf, logsumexp2, run_em, sigmoid};
+use super::em::{clamp_probability, log_binom_pmf, logsumexp2, run_em, run_em_multistart, sigmoid};
 use super::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::data::{AssignmentResult, LoadedInput};
 
@@ -18,6 +18,7 @@ pub struct BinomialModel {
     pub tol: f32,
     pub min_nonzero: u32,
     pub min_max_count: u32,
+    pub n_restarts: u32,
 }
 
 impl Default for BinomialModel {
@@ -29,6 +30,7 @@ impl Default for BinomialModel {
             tol: 1e-6,
             min_nonzero: 2,
             min_max_count: 2,
+            n_restarts: 5,
         }
     }
 }
@@ -135,6 +137,7 @@ impl AssignmentModel for BinomialModel {
             "tol": self.tol,
             "min_nonzero": self.min_nonzero,
             "min_max_count": self.min_max_count,
+            "n_restarts": self.n_restarts,
         })
     }
 }
@@ -146,7 +149,7 @@ impl BinomialModel {
         if n_nonzero < self.min_nonzero || max_count < self.min_max_count {
             return None;
         }
-        Some(fit_mixture(data, n_batches, self.max_em_iters, self.inner_max_iters, self.tol as f64))
+        Some(fit_mixture(data, n_batches, self.max_em_iters, self.inner_max_iters, self.tol as f64, self.n_restarts))
     }
 }
 
@@ -160,30 +163,34 @@ fn fit_mixture(
     max_em_iters: u32,
     inner_max_iters: u32,
     tol: f64,
+    n_restarts: u32,
 ) -> FitParams {
-    let init = initialize_params(data, n_batches);
-    let mut responsibilities = vec![0.0f64; data.len()];
-
-    run_em(
-        init,
-        |params| {
-            let mut log_lik = 0.0;
-            for (idx, &(y, n, b)) in data.iter().enumerate() {
-                let gb = params.gamma[b as usize];
-                let p0 = sigmoid(params.beta0 + gb);
-                let p1 = sigmoid(params.beta0 + params.beta1 + gb);
-                let log_bg = (1.0 - params.pi).ln() + log_binom_pmf(y, n, p0);
-                let log_sig = params.pi.ln() + log_binom_pmf(y, n, p1);
-                let denom = logsumexp2(log_bg, log_sig);
-                responsibilities[idx] = (log_sig - denom).exp();
-                log_lik += denom;
-            }
-            let new_params = m_step(params, data, &responsibilities, inner_max_iters);
-            (new_params, log_lik)
-        },
-        max_em_iters,
-        tol,
-    )
+    let base_init = initialize_params(data, n_batches);
+    run_em_multistart(n_restarts, |pi_k| {
+        let mut init = base_init.clone();
+        init.pi = pi_k;
+        let mut responsibilities = vec![0.0f64; data.len()];
+        run_em(
+            init,
+            |params| {
+                let mut ll = 0.0;
+                for (idx, &(y, n, b)) in data.iter().enumerate() {
+                    let gb = params.gamma[b as usize];
+                    let p0 = sigmoid(params.beta0 + gb);
+                    let p1 = sigmoid(params.beta0 + params.beta1 + gb);
+                    let log_bg = (1.0 - params.pi).ln() + log_binom_pmf(y, n, p0);
+                    let log_sig = params.pi.ln() + log_binom_pmf(y, n, p1);
+                    let denom = logsumexp2(log_bg, log_sig);
+                    responsibilities[idx] = (log_sig - denom).exp();
+                    ll += denom;
+                }
+                let new_params = m_step(params, data, &responsibilities, inner_max_iters);
+                (new_params, ll)
+            },
+            max_em_iters,
+            tol,
+        )
+    })
 }
 
 fn initialize_params(data: &[(f64, f64, u16)], n_batches: usize) -> FitParams {
@@ -445,7 +452,7 @@ mod tests {
         let mut data: Vec<(f64, f64, u16)> = (0..12).map(|i| (1.0 + (i % 2) as f64, n, 0u16)).collect();
         data.extend((0..8).map(|i| (38.0 + i as f64, n, 0u16)));
 
-        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8);
+        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8, 5);
         let p_bg = sigmoid(fitted.beta0);
         let p_sig = sigmoid(fitted.beta0 + fitted.beta1);
 
@@ -469,7 +476,7 @@ mod tests {
         for i in 0..12 { data.push((4.0 + (i % 2) as f64, n, 1u16)); }
         for i in 0..8  { data.push((42.0 + i as f64, n, 1u16)); }
 
-        let fitted = fit_mixture(&data, 2, 200, 50, 1e-8);
+        let fitted = fit_mixture(&data, 2, 200, 50, 1e-8, 5);
         assert_eq!(fitted.gamma[0], 0.0);
         // Truth γ_1 ≈ logit(4.5/50) − logit(1.5/50) ≈ 1.17; the EM lands near 0.90 here
         // (binomial logit pulls in toward 0 more than Poisson β0 does at small p). Window

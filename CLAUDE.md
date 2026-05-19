@@ -80,7 +80,5 @@ Not parallelised:
 
 1. `--threads N` CLI + `n_jobs` Python — needed before HPC use
 2. `--params` CLI flag — no way to override model defaults from the shell
-3. Multiple EM restarts per guide — single deterministic init; weak-signal guides
-   may land in a local optimum
-4. MEX input — CLI design specifies it; currently only H5AD accepted
-5. H5MU output + RNA passthrough — primary output format; currently only H5AD/CSV
+3. MEX input — CLI design specifies it; currently only H5AD accepted
+4. H5MU output + RNA passthrough — primary output format; currently only H5AD/CSV
