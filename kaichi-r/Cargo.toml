@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "kaichi"
+name = "kaichi_r"
 crate-type = ["cdylib"]
 
 [dependencies]
