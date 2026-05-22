@@ -8,60 +8,44 @@ permissions:
   contents: read
 
 jobs:
-  # ── Linux x86_64 ────────────────────────────────────────────────────────────
-  build-linux:
-    name: Build (Linux x86_64)
-    runs-on: ubuntu-latest
+  # ── Wheels (matrix) ─────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            hdf5-dir: /usr
+            args: --release --manifest-path kaichi-py/Cargo.toml --out dist
+            before-script-linux: yum install -y hdf5-devel
+            artifact: wheels-linux-x86_64
+          - name: macOS arm64
+            runner: macos-latest
+            hdf5-dir: /opt/homebrew/opt/hdf5
+            args: --release --manifest-path kaichi-py/Cargo.toml --out dist --target aarch64-apple-darwin
+            artifact: wheels-macos-arm64
+          - name: macOS x86_64
+            runner: macos-13
+            hdf5-dir: /usr/local/opt/hdf5
+            args: --release --manifest-path kaichi-py/Cargo.toml --out dist --target x86_64-apple-darwin
+            artifact: wheels-macos-x86_64
     steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
-        env:
-          HDF5_DIR: /usr
-        with:
-          command: build
-          args: --release --manifest-path kaichi-py/Cargo.toml --out dist
-          before-script-linux: yum install -y hdf5-devel
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-linux-x86_64
-          path: dist
-
-  # ── macOS arm64 (Apple Silicon) ─────────────────────────────────────────────
-  build-macos-arm:
-    name: Build (macOS arm64)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install HDF5
+        if: runner.os == 'macOS'
         run: brew install hdf5
       - uses: PyO3/maturin-action@v1
         env:
-          HDF5_DIR: /opt/homebrew/opt/hdf5
+          HDF5_DIR: ${{ matrix.hdf5-dir }}
         with:
           command: build
-          args: --release --manifest-path kaichi-py/Cargo.toml --out dist --target aarch64-apple-darwin
-      - uses: actions/upload-artifact@v4
+          args: ${{ matrix.args }}
+          before-script-linux: ${{ matrix.before-script-linux }}
+      - uses: actions/upload-artifact@v7
         with:
-          name: wheels-macos-arm64
-          path: dist
-
-  # ── macOS x86_64 (Intel) ────────────────────────────────────────────────────
-  build-macos-x86:
-    name: Build (macOS x86_64)
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install HDF5
-        run: brew install hdf5
-      - uses: PyO3/maturin-action@v1
-        env:
-          HDF5_DIR: /usr/local/opt/hdf5
-        with:
-          command: build
-          args: --release --manifest-path kaichi-py/Cargo.toml --out dist --target x86_64-apple-darwin
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-macos-x86_64
+          name: ${{ matrix.artifact }}
           path: dist
 
   # ── Source distribution ──────────────────────────────────────────────────────
@@ -69,12 +53,12 @@ jobs:
     name: Source distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --manifest-path kaichi-py/Cargo.toml --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: dist
@@ -82,13 +66,13 @@ jobs:
   # ── Publish to PyPI ──────────────────────────────────────────────────────────
   publish:
     name: Publish to PyPI
-    needs: [build-linux, build-macos-arm, build-macos-x86, sdist]
+    needs: [build, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write # required for OIDC trusted publishing
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
           path: dist
