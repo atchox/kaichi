@@ -42,6 +42,7 @@ jobs:
         with:
           command: build
           args: ${{ matrix.args }}
+          manylinux: manylinux2014
           before-script-linux: ${{ matrix.before-script-linux }}
       - uses: actions/upload-artifact@v7
         with:
