@@ -1,5 +1,10 @@
 # kaichi
 
+[![PyPI](https://img.shields.io/pypi/v/kaichi)](https://pypi.org/project/kaichi/)
+[![Python](https://img.shields.io/pypi/pyversions/kaichi)](https://pypi.org/project/kaichi/)
+[![License](https://img.shields.io/github/license/atchox/kaichi)](LICENSE)
+[![Release](https://img.shields.io/github/actions/workflow/status/atchox/kaichi/release.yml?label=release)](https://github.com/atchox/kaichi/actions/workflows/release.yml)
+
 CRISPR guide assignment for Perturb-seq. Takes a guide-count matrix from Cell Ranger
 and produces a per-cell assignment table — which guide each cell received, with
 confidence scores and multi-infection flags.

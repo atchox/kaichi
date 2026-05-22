@@ -1,5 +1,9 @@
 # kaichi — Python
 
+[![PyPI](https://img.shields.io/pypi/v/kaichi)](https://pypi.org/project/kaichi/)
+[![Python](https://img.shields.io/pypi/pyversions/kaichi)](https://pypi.org/project/kaichi/)
+[![License](https://img.shields.io/github/license/atchox/kaichi)](https://github.com/atchox/kaichi/blob/main/LICENSE)
+
 CRISPR guide assignment for Perturb-seq, as a Python library.
 
 ## Install

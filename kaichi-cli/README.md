@@ -1,5 +1,7 @@
 # kaichi — CLI
 
+[![License](https://img.shields.io/github/license/atchox/kaichi)](https://github.com/atchox/kaichi/blob/main/LICENSE)
+
 CRISPR guide assignment for Perturb-seq, as a command-line tool.
 
 ## Install
