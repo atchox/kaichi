@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "kaichi"
 dynamic = ["version"]
 description = "Perturb-seq guide assignment — Python bindings to the kaichi-core Rust library"
-readme = "../README.md"
+readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "kaichi contributors" }]
 requires-python = ">=3.11"
