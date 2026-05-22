@@ -27,7 +27,7 @@ jobs:
             args: --release --manifest-path kaichi-py/Cargo.toml --out dist --target aarch64-apple-darwin
             artifact: wheels-macos-arm64
           - name: macOS x86_64
-            runner: macos-13
+            runner: macos-26-intel
             hdf5-dir: /usr/local/opt/hdf5
             args: --release --manifest-path kaichi-py/Cargo.toml --out dist --target x86_64-apple-darwin
             artifact: wheels-macos-x86_64
