@@ -1,0 +1,19 @@
+# cargo-release workspace configuration.
+# See RELEASING.md for the full release workflow.
+#
+# Usage:
+#   cargo release patch   # 0.1.0 → 0.1.1
+#   cargo release minor   # 0.1.0 → 0.2.0
+#   cargo release major   # 0.1.0 → 1.0.0
+
+# PyPI is the public artifact; Rust crates are not published to crates.io.
+publish = false
+
+# Tag format matches what git_version!() strips to a clean semver at the exact tag.
+tag-name = "v{{version}}"
+
+# Push the version bump commit and tag so GitHub Actions picks up the release.
+push = true
+
+# Run the core test suite before tagging.
+pre-release-hook = ["cargo", "test", "-p", "kaichi-core", "-p", "kaichi-cli"]

@@ -23,9 +23,8 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from ._native import __version__
 from . import _native
-
-__version__ = "0.1.0"
 
 __all__ = ["assign", "__version__"]
 

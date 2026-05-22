@@ -213,10 +213,13 @@ fn extract<'py>(
     ))
 }
 
+const VERSION: &str = git_version::git_version!(fallback = env!("CARGO_PKG_VERSION"));
+
 /// The compiled module lives at `kaichi._native`; the pure-Python wrapper at
 /// `python/kaichi/__init__.py` imports from it.
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", VERSION)?;
     m.add_function(wrap_pyfunction!(_assign_from_h5ad_inmem, m)?)?;
     Ok(())
 }
