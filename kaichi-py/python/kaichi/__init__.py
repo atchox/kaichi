@@ -10,7 +10,12 @@ Public API:
     #   .obs[...]                — per-cell assignment columns
     #   .uns["kaichi"]           — provenance ({"model", "model_params", "version"})
 
-See docs/design/binding-interop.md (section "Python v0.1") for the contract.
+    # Two-stage score/decide API (v0.2):
+    scores = kaichi.score("gRNA_counts.h5ad", model="poisson_gauss", n_jobs=8)
+    a1 = kaichi.decide(scores, min_confidence=0.7)  # pyarrow.Table
+    a2 = kaichi.decide(scores, min_confidence=0.9)  # reuse cached scores
+
+See docs/design/binding-interop.md for the contract.
 """
 
 from __future__ import annotations
@@ -21,12 +26,16 @@ from typing import Any
 import anndata
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import scipy.sparse as sp
 
 from ._native import __version__
 from . import _native
 
-__all__ = ["assign", "__version__"]
+# Re-export the Rust class under the public name ScoreResult.
+ScoreResult = _native.PyScoreResult
+
+__all__ = ["assign", "score", "decide", "ScoreResult", "__version__"]
 
 
 def assign(
@@ -130,3 +139,58 @@ def assign(
         layers={"assigned": assigned},
         uns=uns,
     )
+
+
+def score(
+    h5ad_path: str,
+    model: str = "poisson_gauss",
+    *,
+    n_jobs: int | None = None,
+) -> ScoreResult:
+    """Score guide counts with a two-stage model; return a cached ScoreResult.
+
+    The expensive EM fitting runs once. Call :func:`decide` one or more times
+    with different ``min_confidence`` thresholds without re-fitting.
+
+    Parameters
+    ----------
+    h5ad_path :
+        Path to an h5ad with guide UMI counts in ``X``.
+    model :
+        One of ``poisson_gauss``, ``poisson``, ``neg_binomial``, ``binomial``.
+        Single-stage models (``umi``, ``ratio``, ``max``) raise ``ValueError``
+        — use :func:`assign` for those.
+    n_jobs :
+        Rayon worker threads. ``None`` / ``0`` = half of logical cores.
+
+    Returns
+    -------
+    ScoreResult
+        A Rust-owned score matrix. Access via ``.values_csr``, ``.cell_barcodes``,
+        ``.guide_ids``, ``.shape``, ``.model``, ``.model_params``.
+    """
+    return _native._score(h5ad_path, model, n_jobs=n_jobs)
+
+
+def decide(
+    scores: ScoreResult,
+    min_confidence: float = 0.9,
+) -> pa.Table:
+    """Apply a confidence threshold to a :class:`ScoreResult`.
+
+    Parameters
+    ----------
+    scores :
+        The cached output of :func:`score`.
+    min_confidence :
+        Posterior threshold in [0, 1]. Entries below this threshold are
+        left unassigned.
+
+    Returns
+    -------
+    pyarrow.RecordBatch
+        One row per cell with columns: ``cell_barcode``, ``guide_id``,
+        ``assignment_confidence``, ``umi_count``, ``is_unassigned``,
+        ``is_multi_infected``, ``n_guides_detected``.
+    """
+    return _native._decide(scores, min_confidence)

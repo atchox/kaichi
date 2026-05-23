@@ -1,10 +1,11 @@
 use super::AssignmentModel;
-use super::em::{clamp_probability, log_binom_pmf, logsumexp2, run_em, run_em_multistart, sigmoid};
-use super::output::{n_detected_u8, AssignmentOutputBuilder};
+use super::em::{clamp_probability, log_binom_pmf, logsumexp2, sigmoid};
+use super::em_count_mixture::{decide_threshold, score_em_count_mixture, EmConfig, EmCountMixture, Gating, GuideData};
+use super::TwoStage;
 use crate::data::{AssignmentResult, LoadedInput};
+use crate::score::{ModelKind, ScoreMatrix};
 
 use anyhow::Result;
-use rayon::prelude::*;
 use serde_json::{json, Value};
 
 /// Per-guide Binomial mixture using total guide UMIs as the number of trials.
@@ -36,13 +37,17 @@ impl Default for BinomialModel {
 }
 
 #[derive(Clone, Debug)]
-struct FitParams {
-    pi: f64,
-    beta0: f64,
-    beta1: f64,
+pub struct FitParams {
+    pub pi: f64,
+    pub beta0: f64,
+    pub beta1: f64,
     /// Per-batch logit offset; `gamma[0]` is anchored at 0 for identifiability.
-    gamma: Vec<f64>,
+    pub gamma: Vec<f64>,
 }
+
+// ---------------------------------------------------------------------------
+// AssignmentModel
+// ---------------------------------------------------------------------------
 
 impl AssignmentModel for BinomialModel {
     fn name(&self) -> &'static str {
@@ -50,83 +55,8 @@ impl AssignmentModel for BinomialModel {
     }
 
     fn assign(&self, input: &LoadedInput) -> Result<AssignmentResult> {
-        let n_cells = input.counts.n_cells;
-        let n_guides = input.counts.n_guides;
-        let csc = input.counts.csc();
-        let total_counts = &input.covariates.total_counts;
-        let batch = &input.covariates.batch;
-        let n_batches = batch.n_batches();
-
-        // Per-cell trial count (total guide UMIs).
-        let trial_counts: Vec<f64> = (0..n_cells)
-            .map(|i| total_counts.value(i) as f64)
-            .collect();
-
-        let guide_fits: Vec<Option<FitParams>> = (0..n_guides)
-            .into_par_iter()
-            .map(|g| {
-                let col = csc.get_col(g).unwrap();
-                // Data: (y_i, n_i, b_i) where y_i = guide count, n_i = total UMIs, b_i = batch.
-                let data: Vec<(f64, f64, u16)> = col
-                    .row_indices()
-                    .iter()
-                    .zip(col.values())
-                    .filter(|(&i, &v)| v > 0 && trial_counts[i] > 0.0)
-                    .map(|(&i, &v)| (v as f64, trial_counts[i], batch.codes[i]))
-                    .collect();
-                self.fit_guide(&data, n_batches)
-            })
-            .collect();
-
-        let csr = input.counts.csr();
-        let guide_ids_arr = &input.guide_metadata.guide_ids;
-        let cell_barcodes = &input.covariates.cell_barcodes;
-        let mut out = AssignmentOutputBuilder::new(n_cells, n_guides, self.name());
-
-        for cell in 0..n_cells {
-            let n_i = trial_counts[cell];
-            let b = batch.codes[cell] as usize;
-            let row = csr.get_row(cell).unwrap();
-            let mut best: Option<(usize, f32, u32)> = None;
-            let mut n_passing: usize = 0;
-
-            for (&guide_idx, &count) in row.col_indices().iter().zip(row.values()) {
-                let params = match &guide_fits[guide_idx] {
-                    Some(p) => p,
-                    None => continue,
-                };
-                if n_i <= 0.0 { continue; }
-                let post = posterior_signal(count as f64, n_i, params, b) as f32;
-                if post >= self.min_confidence {
-                    n_passing += 1;
-                    match best {
-                        None => best = Some((guide_idx, post, count)),
-                        Some((_, bp, bc)) => {
-                            if post > bp || (post == bp && count > bc) {
-                                best = Some((guide_idx, post, count));
-                            }
-                        }
-                    }
-                    out.push_assigned_triple(cell, guide_idx);
-                }
-            }
-
-            let n_det = n_detected_u8(n_passing);
-            match best {
-                None => out.append_unassigned(n_det),
-                Some((guide_idx, post, count)) => {
-                    out.append_assigned(
-                        guide_ids_arr.value(guide_idx),
-                        count,
-                        post,
-                        n_passing > 1,
-                        n_det,
-                    );
-                }
-            }
-        }
-
-        out.finish(cell_barcodes, true)
+        let scores = self.score(input)?;
+        self.decide(&scores, self.min_confidence)
     }
 
     fn params_json(&self) -> Value {
@@ -142,60 +72,109 @@ impl AssignmentModel for BinomialModel {
     }
 }
 
-impl BinomialModel {
-    fn fit_guide(&self, data: &[(f64, f64, u16)], n_batches: usize) -> Option<FitParams> {
-        let n_nonzero = data.len() as u32;
-        let max_count = data.iter().map(|(y, _, _)| *y as u32).max().unwrap_or(0);
-        if n_nonzero < self.min_nonzero || max_count < self.min_max_count {
-            return None;
-        }
-        Some(fit_mixture(data, n_batches, self.max_em_iters, self.inner_max_iters, self.tol as f64, self.n_restarts))
+// ---------------------------------------------------------------------------
+// TwoStage
+// ---------------------------------------------------------------------------
+
+impl TwoStage for BinomialModel {
+    fn score(&self, input: &LoadedInput) -> Result<ScoreMatrix> {
+        score_em_count_mixture(self, ModelKind::Binomial, self.params_json(), input)
+    }
+
+    fn decide(&self, scores: &ScoreMatrix, min_confidence: f32) -> Result<AssignmentResult> {
+        decide_threshold(scores, min_confidence)
     }
 }
 
 // ---------------------------------------------------------------------------
-// EM
+// EmCountMixture
 // ---------------------------------------------------------------------------
 
-fn fit_mixture(
-    data: &[(f64, f64, u16)],
-    n_batches: usize,
-    max_em_iters: u32,
-    inner_max_iters: u32,
-    tol: f64,
-    n_restarts: u32,
-) -> FitParams {
-    let base_init = initialize_params(data, n_batches);
-    run_em_multistart(n_restarts, |pi_k| {
-        let mut init = base_init.clone();
-        init.pi = pi_k;
-        let mut responsibilities = vec![0.0f64; data.len()];
-        run_em(
-            init,
-            |params| {
-                let mut ll = 0.0;
-                for (idx, &(y, n, b)) in data.iter().enumerate() {
-                    let gb = params.gamma[b as usize];
-                    let p0 = sigmoid(params.beta0 + gb);
-                    let p1 = sigmoid(params.beta0 + params.beta1 + gb);
-                    let log_bg = (1.0 - params.pi).ln() + log_binom_pmf(y, n, p0);
-                    let log_sig = params.pi.ln() + log_binom_pmf(y, n, p1);
-                    let denom = logsumexp2(log_bg, log_sig);
-                    responsibilities[idx] = (log_sig - denom).exp();
-                    ll += denom;
-                }
-                let new_params = m_step(params, data, &responsibilities, inner_max_iters);
-                (new_params, ll)
-            },
-            max_em_iters,
-            tol,
-        )
-    })
+impl EmCountMixture for BinomialModel {
+    type FitParams = FitParams;
+
+    fn gating(&self) -> Gating {
+        Gating { min_nonzero: self.min_nonzero, min_max_count: self.min_max_count }
+    }
+
+    fn em_config(&self) -> EmConfig {
+        EmConfig {
+            max_iters: self.max_em_iters,
+            n_restarts: self.n_restarts,
+            tol: self.tol as f64,
+        }
+    }
+
+    /// Binomial covariate is the total guide UMI count per cell (trial count),
+    /// not log_depth.
+    fn prepare_covariates(&self, input: &LoadedInput) -> Vec<f64> {
+        let tc = &input.covariates.total_counts;
+        (0..input.counts.n_cells)
+            .map(|i| tc.value(i) as f64)
+            .collect()
+    }
+
+    /// Also filter cells where trial count == 0 (no UMIs → Binomial undefined).
+    fn guide_data(
+        &self,
+        col_row_indices: &[usize],
+        col_values: &[u32],
+        covariates: &[f64],
+        batch_codes: &[u16],
+        _n_cells: usize,
+    ) -> GuideData {
+        let triples = col_row_indices
+            .iter()
+            .zip(col_values)
+            .filter(|(&i, &v)| v > 0 && covariates[i] > 0.0)
+            .map(|(&i, &v)| (v as f64, covariates[i], batch_codes[i]))
+            .collect();
+        GuideData { triples, n_zeros: 0 }
+    }
+
+    fn init(&self, data: &GuideData, n_batches: usize, pi_k: f64) -> FitParams {
+        let mut p = initialize_params(&data.triples, n_batches);
+        p.pi = pi_k;
+        p
+    }
+
+    fn em_cycle(
+        &self,
+        params: FitParams,
+        data: &GuideData,
+        _n_batches: usize,
+        responsibilities: &mut Vec<f64>,
+    ) -> (FitParams, f64) {
+        // covariate = trial count (n_i), not log_depth
+        let mut ll = 0.0;
+        for (idx, &(y, n, b)) in data.triples.iter().enumerate() {
+            let gb = params.gamma[b as usize];
+            let p0 = sigmoid(params.beta0 + gb);
+            let p1 = sigmoid(params.beta0 + params.beta1 + gb);
+            let log_bg = (1.0 - params.pi).ln() + log_binom_pmf(y, n, p0);
+            let log_sig = params.pi.ln() + log_binom_pmf(y, n, p1);
+            let denom = logsumexp2(log_bg, log_sig);
+            responsibilities[idx] = (log_sig - denom).exp();
+            ll += denom;
+        }
+        let new_params = m_step(params, &data.triples, responsibilities, self.inner_max_iters);
+        (new_params, ll)
+    }
+
+    fn posterior(&self, count: u32, covariate: f64, params: &FitParams, batch: u16) -> f32 {
+        // covariate = trial count
+        if covariate <= 0.0 {
+            return 0.0;
+        }
+        posterior_signal(count as f64, covariate, params, batch as usize) as f32
+    }
 }
 
+// ---------------------------------------------------------------------------
+// EM math (unchanged)
+// ---------------------------------------------------------------------------
+
 fn initialize_params(data: &[(f64, f64, u16)], n_batches: usize) -> FitParams {
-    // Per-batch background logit: log(mean_prop_b / (1 − mean_prop_b)).
-    // Batch-0 baseline goes into β0; γ_b = batch-b logit − batch-0 logit for b > 0.
     let mut per_batch_y: Vec<f64> = vec![0.0; n_batches];
     let mut per_batch_n: Vec<f64> = vec![0.0; n_batches];
     for &(y, n, b) in data {
@@ -215,7 +194,6 @@ fn initialize_params(data: &[(f64, f64, u16)], n_batches: usize) -> FitParams {
         gamma[b] = (logit_of(mean_prop_b[b]) - beta0).clamp(-5.0, 5.0);
     }
 
-    // β1 from the global max proportion vs global mean — signal scale shared across batches.
     let max_prop: f64 = data.iter().map(|(y, n, _)| y / n).fold(0.0_f64, f64::max);
     let mean_prop_all: f64 = data.iter().map(|(y, n, _)| y / n).sum::<f64>() / data.len() as f64;
     let beta1 = (logit_of(max_prop) - logit_of(mean_prop_all)).max(0.5);
@@ -232,7 +210,6 @@ fn m_step(
     let pi = clamp_probability(resp.iter().sum::<f64>() / data.len() as f64);
     let n_batches = params.gamma.len();
 
-    // Arrow-Hessian Schur step in (η_0, ..., η_{B−1}, β1). Binomial IRLS weight is n·p·(1−p).
     let mut eta: Vec<f64> = (0..n_batches)
         .map(|b| params.beta0 + params.gamma[b])
         .collect();
@@ -268,19 +245,25 @@ fn m_step(
         }
         let d_beta1 = if schur.abs() > 1e-14 {
             (g_schur / schur).clamp(-3.0, 3.0)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         let mut max_step = d_beta1.abs();
         for b in 0..n_batches {
             let d_eta = if d[b] > 1e-14 {
                 ((g_eta[b] - c[b] * d_beta1) / d[b]).clamp(-3.0, 3.0)
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             eta[b] += d_eta;
             max_step = max_step.max(d_eta.abs());
         }
         beta1 += d_beta1;
 
-        if max_step < 1e-8 { break; }
+        if max_step < 1e-8 {
+            break;
+        }
     }
 
     let beta0 = eta[0];
@@ -289,7 +272,6 @@ fn m_step(
         gamma[b] = eta[b] - eta[0];
     }
 
-    // Same identifiability relabel as Poisson; see comment there.
     let (pi, beta0, beta1) = if beta1 < 0.0 {
         (1.0 - pi, beta0 + beta1, -beta1)
     } else {
@@ -336,8 +318,6 @@ mod tests {
 
     #[test]
     fn assigns_high_proportion_cells() {
-        // Background: y=1 out of n=50 (proportion=0.02).
-        // Signal: y=40 out of n=50 (proportion=0.80).
         let input = make_input_with_totals(
             6, 1,
             vec![(0,0,1),(1,0,1),(2,0,1),(3,0,40),(4,0,42),(5,0,45)],
@@ -386,7 +366,6 @@ mod tests {
 
     #[test]
     fn multi_infected_flagged() {
-        // Cell 3 has signal-level counts for both guides. totals=100 so bg prop=0.01, signal prop≈0.40.
         let input = make_input_with_totals(8, 2, vec![
             (0,0,1),(0,1,1),(1,0,1),(1,1,1),(2,0,1),
             (3,0,40),(3,1,42),
@@ -400,7 +379,7 @@ mod tests {
         assert!(is_multi.value(3), "cell 3 should be multi-infected");
     }
 
-    // ---- posterior_signal (Binomial Bayes) ----
+    // ---- posterior_signal ----
 
     fn fp(pi: f64, beta0: f64, beta1: f64) -> FitParams {
         FitParams { pi, beta0, beta1, gamma: vec![0.0] }
@@ -436,54 +415,29 @@ mod tests {
 
     #[test]
     fn binomial_posterior_uses_batch_gamma() {
-        // γ_1 > 0 raises batch 1's logit baseline → same y/n looks more like background.
         let p = FitParams { pi: 0.3, beta0: -3.0, beta1: 3.0, gamma: vec![0.0, 2.0] };
         let b0 = posterior_signal(5.0, 50.0, &p, 0);
         let b1 = posterior_signal(5.0, 50.0, &p, 1);
         assert!(b0 > b1, "γ_1 > 0 should suppress signal in batch 1: b0={b0}, b1={b1}");
     }
 
-    // ---- fit_mixture: synthetic recovery ----
-
     #[test]
-    fn fit_mixture_recovers_bimodal_binomial() {
-        // 12 background (1–2 of 50, prop ≈ 0.03) + 8 signal (38–45 of 50, prop ≈ 0.83), single batch.
-        let n = 50.0;
-        let mut data: Vec<(f64, f64, u16)> = (0..12).map(|i| (1.0 + (i % 2) as f64, n, 0u16)).collect();
-        data.extend((0..8).map(|i| (38.0 + i as f64, n, 0u16)));
-
-        let fitted = fit_mixture(&data, 1, 200, 25, 1e-8, 5);
-        let p_bg = sigmoid(fitted.beta0);
-        let p_sig = sigmoid(fitted.beta0 + fitted.beta1);
-
-        assert!(p_sig > p_bg, "p_sig={p_sig} ≤ p_bg={p_bg}");
-        assert!(p_bg < 0.10, "p_bg should track low cluster (~0.03), got {p_bg}");
-        assert!(p_sig > 0.70, "p_sig should track high cluster (~0.83), got {p_sig}");
-        assert!((0.2..=0.6).contains(&fitted.pi), "pi: {}", fitted.pi);
-        assert_eq!(fitted.gamma, vec![0.0]);
-    }
-
-    #[test]
-    fn fit_mixture_recovers_batch_offsets() {
-        // Two batches: same signal pattern but batch 1's background runs at ~3× the
-        // batch-0 background proportion → γ_1 should land positive.
-        let n = 50.0;
-        let mut data: Vec<(f64, f64, u16)> = Vec::new();
-        // batch 0: 12 bg (y = 1 or 2) + 8 sig (y ≈ 40)
-        for i in 0..12 { data.push((1.0 + (i % 2) as f64, n, 0u16)); }
-        for i in 0..8  { data.push((38.0 + i as f64, n, 0u16)); }
-        // batch 1: 12 bg (y = 4 or 5) + 8 sig (y ≈ 45)
-        for i in 0..12 { data.push((4.0 + (i % 2) as f64, n, 1u16)); }
-        for i in 0..8  { data.push((42.0 + i as f64, n, 1u16)); }
-
-        let fitted = fit_mixture(&data, 2, 200, 50, 1e-8, 5);
-        assert_eq!(fitted.gamma[0], 0.0);
-        // Truth γ_1 ≈ logit(4.5/50) − logit(1.5/50) ≈ 1.17; the EM lands near 0.90 here
-        // (binomial logit pulls in toward 0 more than Poisson β0 does at small p). Window
-        // is wider than Poisson's to absorb that systematic bias without being toothless.
-        assert!(
-            (fitted.gamma[1] - 1.17).abs() < 0.30,
-            "γ_1 expected ≈ 1.17, got {:.3}", fitted.gamma[1]
+    fn score_and_decide_matches_assign() {
+        let input = make_input_with_totals(
+            6, 1,
+            vec![(0,0,1),(1,0,1),(2,0,1),(3,0,40),(4,0,42),(5,0,45)],
+            vec![50,50,50,50,50,50],
         );
+        let model = BinomialModel { min_confidence: 0.8, ..Default::default() };
+        let direct = model.assign(&input).unwrap();
+        let scores = model.score(&input).unwrap();
+        let via_decide = model.decide(&scores, 0.8).unwrap();
+        let is_u_d = direct.batch.column_by_name("is_unassigned").unwrap()
+            .as_any().downcast_ref::<BooleanArray>().unwrap();
+        let is_u_s = via_decide.batch.column_by_name("is_unassigned").unwrap()
+            .as_any().downcast_ref::<BooleanArray>().unwrap();
+        for i in 0..6 {
+            assert_eq!(is_u_d.value(i), is_u_s.value(i), "cell {i}");
+        }
     }
 }

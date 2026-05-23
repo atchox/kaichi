@@ -1,8 +1,12 @@
 //! Python bindings for kaichi.
 //!
-//! This crate exposes a single private `#[pyfunction]` called from the
-//! Python wrapper at `kaichi-py/python/kaichi/__init__.py`. See
-//! `docs/design/binding-interop.md` ("Python v0.1") for the contract.
+//! Exposes three private functions consumed by the Python wrapper at
+//! `kaichi-py/python/kaichi/__init__.py`:
+//!
+//! - `_assign_from_h5ad_inmem` — one-shot assign (all models); returns the
+//!   existing 10-tuple for backwards compatibility with the v0.1 Python layer.
+//! - `_score` — two-stage models only; returns a `PyScoreResult` (zero-copy).
+//! - `_decide` — threshold a `PyScoreResult`; returns an Arrow RecordBatch.
 
 use kaichi_core::data::{AssignmentResult, LoadedInput};
 use kaichi_core::io::read::read_h5ad;
@@ -17,29 +21,139 @@ use kaichi_core::models::{
     quantiles::QuantilesModel,
     ratio::RatioModel,
     umi::UmiModel,
-    AssignmentModel,
+    AssignmentModel, TwoStage,
 };
+use kaichi_core::score::ScoreMatrix;
 
 use arrow::array::Array as _;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_arrow::PyRecordBatch;
 use std::path::Path;
+use std::sync::Arc;
 
-/// Read an h5ad, run the named model, and return the pieces Python needs to
-/// build an `anndata.AnnData` in memory.
+// ---------------------------------------------------------------------------
+// PyScoreResult
+// ---------------------------------------------------------------------------
+
+/// Python-facing wrapper around a Rust-owned `ScoreMatrix`.
 ///
-/// Returns a 10-tuple:
-///   (per_cell_batch, assigned_indptr, assigned_indices,
-///    x_data, x_indices, x_indptr,
-///    cell_barcodes, guide_ids,
-///    model_name, model_params_json)
-///
-/// Per-cell columns travel as a `pyarrow.RecordBatch` (zero-copy via the Arrow
-/// C Data Interface). CSR layouts travel as `numpy.uint32` arrays — the
-/// binary `assigned` matrix's `data` array is trivially all-ones and is
-/// reconstructed Python-side rather than shuttled across.
+/// All Arrow arrays inside are Arc-backed; returning them to Python via
+/// `pyo3_arrow` bumps the refcount — no buffer copies.
+#[pyclass(frozen)]
+pub struct PyScoreResult {
+    inner: ScoreMatrix,
+}
+
+#[pymethods]
+impl PyScoreResult {
+    /// The three CSR arrays as an Arrow RecordBatch (zero-copy via PyCapsule).
+    /// Schema: data Float32, indices UInt32, indptr UInt32.
+    #[getter]
+    fn values_csr(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data", DataType::Float32, false),
+            Field::new("indices", DataType::UInt32, false),
+            Field::new("indptr", DataType::UInt32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(self.inner.data.clone()) as Arc<dyn arrow::array::Array>,
+                Arc::new(self.inner.indices.clone()),
+                Arc::new(self.inner.indptr.clone()),
+            ],
+        )
+        .map_err(|e| PyValueError::new_err(format!("values_csr: {e}")))?;
+        PyRecordBatch::new(batch).to_pyarrow(py)
+    }
+
+    #[getter]
+    fn cell_barcodes(&self, py: Python<'_>) -> PyResult<PyObject> {
+        use pyo3_arrow::PyArray;
+        PyArray::from_array_ref(Arc::new(self.inner.cell_barcodes.clone())).to_arro3(py)
+    }
+
+    #[getter]
+    fn guide_ids(&self, py: Python<'_>) -> PyResult<PyObject> {
+        use pyo3_arrow::PyArray;
+        PyArray::from_array_ref(Arc::new(self.inner.guide_ids.clone())).to_arro3(py)
+    }
+
+    /// (n_cells, n_guides)
+    #[getter]
+    fn shape(&self) -> (usize, usize) {
+        (self.inner.n_cells(), self.inner.n_guides())
+    }
+
+    #[getter]
+    fn model(&self) -> &'static str {
+        self.inner.model.name()
+    }
+
+    #[getter]
+    fn model_params(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let json_str = serde_json::to_string(&self.inner.model_params)
+            .map_err(|e| PyValueError::new_err(format!("model_params: {e}")))?;
+        let json_mod = py.import_bound("json")?;
+        json_mod.call_method1("loads", (json_str,)).map(|o| o.unbind())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// _score
+// ---------------------------------------------------------------------------
+
+/// Score a guide-count h5ad with a two-stage model. Returns a `PyScoreResult`.
+/// Raises `ValueError` for single-stage models (umi, ratio, max).
+#[pyfunction]
+#[pyo3(signature = (h5ad_path, model, *, n_jobs=None))]
+fn _score(
+    _py: Python<'_>,
+    h5ad_path: &str,
+    model: &str,
+    n_jobs: Option<usize>,
+) -> PyResult<PyScoreResult> {
+    let input = read_h5ad(Path::new(h5ad_path))
+        .map_err(|e| PyIOError::new_err(format!("read_h5ad({h5ad_path}): {e:#}")))?;
+
+    let pool = make_pool(n_jobs)?;
+
+    let score_matrix = pool.install(|| score_model(model, &input))?;
+    Ok(PyScoreResult { inner: score_matrix })
+}
+
+// ---------------------------------------------------------------------------
+// _decide
+// ---------------------------------------------------------------------------
+
+/// Apply a confidence threshold to a `PyScoreResult`. Returns an Arrow RecordBatch.
+#[pyfunction]
+#[pyo3(signature = (scores, min_confidence))]
+fn _decide(
+    py: Python<'_>,
+    scores: PyRef<'_, PyScoreResult>,
+    min_confidence: f32,
+) -> PyResult<PyObject> {
+    // Cast to usize to cross the Ungil bound; safe because `scores` (the PyRef)
+    // remains on the caller stack and keeps the PyScoreResult alive for the full duration.
+    let inner_addr = (&scores.inner as *const ScoreMatrix) as usize;
+    let result = py
+        .allow_threads(|| {
+            let inner = unsafe { &*(inner_addr as *const ScoreMatrix) };
+            kaichi_core::models::em_count_mixture::decide_threshold(inner, min_confidence)
+        })
+        .map_err(|e| PyValueError::new_err(format!("decide: {e:#}")))?;
+    PyRecordBatch::new(result.batch).to_pyarrow(py)
+}
+
+// ---------------------------------------------------------------------------
+// _assign_from_h5ad_inmem  (v0.1 API, preserved for Python layer compatibility)
+// ---------------------------------------------------------------------------
+
 #[pyfunction]
 #[pyo3(signature = (h5ad_path, model, *, min_confidence=None, quantile=None, n_jobs=None))]
 fn _assign_from_h5ad_inmem<'py>(
@@ -64,10 +178,18 @@ fn _assign_from_h5ad_inmem<'py>(
     let input = read_h5ad(Path::new(h5ad_path))
         .map_err(|e| PyIOError::new_err(format!("read_h5ad({h5ad_path}): {e:#}")))?;
 
-    // n_jobs scopes a per-call rayon thread pool. We can't use build_global()
-    // here — Python may call assign() repeatedly within one process, and
-    // build_global() can only fire once. None / 0 → half of total logical
-    // cores (HPC-polite default, matches CLI `--threads 0`).
+    let pool = make_pool(n_jobs)?;
+    let (result, model_name, model_params_json) =
+        pool.install(|| run_model(model, &input, min_confidence, quantile))?;
+
+    extract(py, input, result, model_name, model_params_json)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn make_pool(n_jobs: Option<usize>) -> PyResult<rayon::ThreadPool> {
     let n_threads = match n_jobs {
         Some(n) if n > 0 => n,
         _ => {
@@ -77,18 +199,37 @@ fn _assign_from_h5ad_inmem<'py>(
             (total / 2).max(1)
         }
     };
-    let pool = rayon::ThreadPoolBuilder::new()
+    rayon::ThreadPoolBuilder::new()
         .num_threads(n_threads)
         .build()
-        .map_err(|e| PyValueError::new_err(format!("rayon pool init failed: {e}")))?;
-    let (result, model_name, model_params_json) =
-        pool.install(|| run_model(model, &input, min_confidence, quantile))?;
-
-    extract(py, input, result, model_name, model_params_json)
+        .map_err(|e| PyValueError::new_err(format!("rayon pool init failed: {e}")))
 }
 
-/// Dispatch on model name. Returns the assignment result, the model's static
-/// name, and the model's params as a JSON string (for `uns["kaichi"]`).
+/// Score a two-stage model. Raises ValueError for single-stage models.
+fn score_model(name: &str, input: &LoadedInput) -> PyResult<ScoreMatrix> {
+    macro_rules! score {
+        ($model_expr:expr) => {{
+            let m = $model_expr;
+            m.score(input).map_err(|e| PyValueError::new_err(format!("score: {e:#}")))
+        }};
+    }
+    match name {
+        "poisson_gauss" => score!(PoissonGaussModel::default()),
+        "poisson" => score!(PoissonModel::default()),
+        "neg_binomial" => score!(NegBinomialModel::default()),
+        "binomial" => score!(BinomialModel::default()),
+        "umi" | "ratio" | "max" => Err(PyValueError::new_err(format!(
+            "model {name:?} is single-stage and does not support score(). \
+             Use kaichi.assign() instead."
+        ))),
+        other => Err(PyValueError::new_err(format!(
+            "unknown model {other:?}: expected one of poisson_gauss/poisson/neg_binomial/\
+             binomial/beta2/beta3/quantiles for score(), or any model for assign()"
+        ))),
+    }
+}
+
+/// Dispatch on model name for one-shot assign.
 fn run_model(
     name: &str,
     input: &LoadedInput,
@@ -98,7 +239,7 @@ fn run_model(
     macro_rules! run {
         ($model_expr:expr) => {{
             let m = $model_expr;
-            let res = m.assign(input).map_err(map_assign_err)?;
+            let res = m.assign(input).map_err(|e| PyValueError::new_err(format!("model.assign failed: {e:#}")))?;
             let params = serde_json::to_string(&m.params_json())
                 .map_err(|e| PyValueError::new_err(format!("params_json: {e}")))?;
             (res, m.name(), params)
@@ -155,11 +296,6 @@ fn run_model(
     Ok(out)
 }
 
-fn map_assign_err(e: anyhow::Error) -> PyErr {
-    PyValueError::new_err(format!("model.assign failed: {e:#}"))
-}
-
-/// Pull the RecordBatch and the two CSR layouts out into Python-owned values.
 fn extract<'py>(
     py: Python<'py>,
     input: LoadedInput,
@@ -178,13 +314,10 @@ fn extract<'py>(
     &'static str,
     String,
 )> {
-    // assigned binary CSR: row_offsets + col_indices; data is implicit 1s.
     let assigned = &result.assigned_x;
     let a_indptr: Vec<u32> = assigned.row_offsets().iter().map(|&i| i as u32).collect();
     let a_indices: Vec<u32> = assigned.col_indices().iter().map(|&i| i as u32).collect();
 
-    // input X CSR — preserved on the output AnnData so the user gets the
-    // original counts plus the assignment layer in one object.
     let x_csr = input.counts.csr();
     let x_data: Vec<u32> = x_csr.values().to_vec();
     let x_indices: Vec<u32> = x_csr.col_indices().iter().map(|&i| i as u32).collect();
@@ -215,11 +348,12 @@ fn extract<'py>(
 
 const VERSION: &str = git_version::git_version!(fallback = env!("CARGO_PKG_VERSION"));
 
-/// The compiled module lives at `kaichi._native`; the pure-Python wrapper at
-/// `python/kaichi/__init__.py` imports from it.
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", VERSION)?;
     m.add_function(wrap_pyfunction!(_assign_from_h5ad_inmem, m)?)?;
+    m.add_function(wrap_pyfunction!(_score, m)?)?;
+    m.add_function(wrap_pyfunction!(_decide, m)?)?;
+    m.add_class::<PyScoreResult>()?;
     Ok(())
 }
