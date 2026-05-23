@@ -11,6 +11,7 @@ Read in order:
 7. [binding-interop.md](binding-interop.md) — Arrow C Data Interface handoff, sparse matrix encoding
 8. [cli.md](cli.md) — standalone Rust binary, Snakemake/Nextflow integration
 9. [validation.md](validation.md) — equivalence with baseline implementations, ship criteria (performance benchmarking is external, via omnibenchmark)
+10. [score-decide.md](score-decide.md) — v0.2: split score/decide, Arrow-native `ScoreResult`, EM mixture refactor
 
 These are living design documents. Update them when decisions change rather than
 letting code and docs drift.
