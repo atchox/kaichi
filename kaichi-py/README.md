@@ -19,32 +19,46 @@ Wheels are available for Linux x86_64, macOS arm64, and macOS x86_64 (Python ≥
 ```python
 import kaichi
 
-result = kaichi.assign("gRNA_counts.h5ad", model="poisson_gauss")
-print(result)
-# pyarrow Table: cell_barcode, guide_id, umi_count,
-#                assignment_confidence, is_unassigned,
-#                is_multi_infected, n_guides_detected
-```
+# One-shot assign — returns an AnnData
+adata = kaichi.assign("gRNA_counts.h5ad", model="poisson_gauss")
 
-Convert to pandas or polars:
-
-```python
-df = result.to_pandas()
+# Two-stage: fit once, threshold multiple times
+scores = kaichi.score("gRNA_counts.h5ad", model="poisson_gauss")
+strict = kaichi.decide(scores, min_confidence=0.9)   # pyarrow.RecordBatch
+lenient = kaichi.decide(scores, min_confidence=0.7)  # reuses cached scores
 ```
 
 ## API
 
-### `kaichi.assign(path, model="poisson_gauss", n_jobs=None)`
+### `kaichi.assign(path, model="poisson_gauss", *, min_confidence=None, quantile=None, n_jobs=None)`
+
+Fit and assign in one step. Returns an `anndata.AnnData` with:
+
+- `.X` — raw UMI counts (sparse CSR, uint32)
+- `.layers["assigned"]` — binary sparse CSR, 1 where assigned
+- `.obs` — per-cell assignment columns (see table below)
+- `.uns["kaichi"]` — provenance (`model`, `model_params`, `version`)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `path` | `str \| Path` | — | Path to an `.h5ad` guide-count file |
+| `path` | `str` | — | Path to an `.h5ad` guide-count file |
 | `model` | `str` | `"poisson_gauss"` | Assignment model (see table below) |
+| `min_confidence` | `float \| None` | `None` | Override posterior threshold |
+| `quantile` | `float \| None` | `None` | Top-fraction threshold for the `quantiles` model |
 | `n_jobs` | `int \| None` | `None` | Worker threads; `None` = half of logical cores |
 
-Returns a `pyarrow.Table` with one row per cell.
+### `kaichi.score(path, model="poisson_gauss", *, n_jobs=None)`
 
-### Output columns
+Run the EM fitting stage only; return a `kaichi.ScoreResult`. Raises `ValueError` for
+single-stage models (`umi`, `ratio`, `max`) — use `assign()` for those.
+
+### `kaichi.decide(scores, min_confidence=0.9)`
+
+Apply a confidence threshold to a cached `ScoreResult`. Returns a
+`pyarrow.RecordBatch` with one row per cell. Call multiple times with different
+thresholds without re-fitting.
+
+### `.obs` / output columns
 
 | Column | Type | Notes |
 |---|---|---|
