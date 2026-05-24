@@ -1,4 +1,5 @@
 use crate::data::{AssignmentResult, LoadedInput};
+use crate::score::ScoreMatrix;
 use anyhow::{Context, Result};
 use arrow::array::{Array, BooleanArray, Float32Array, StringArray, UInt8Array};
 use arrow::compute::cast;
@@ -39,8 +40,8 @@ pub fn write_h5ad(
     let n_cells = input.counts.n_cells;
     let n_guides = input.counts.n_guides;
 
-    write_obs(&file, input, result, n_cells)?;
-    write_var(&file, input, n_guides)?;
+    write_obs(&file, &input.covariates.cell_barcodes, result, n_cells)?;
+    write_var(&file, &input.guide_metadata.guide_ids, n_guides)?;
     write_csr_group(&file, "X", input.counts.csr(), n_cells, n_guides)?;
 
     let layers = file.create_group("layers").context("creating /layers")?;
@@ -48,8 +49,106 @@ pub fn write_h5ad(
     write_scalar_str_attr(&layers, "encoding-version", "0.1.0");
     write_csr_group(&layers, "assigned", &result.assigned_x, n_cells, n_guides)?;
 
-    write_uns(&file, model_name, model_params_json)?;
+    write_uns(&file, model_name, model_params_json, "assigned", None)?;
 
+    Ok(())
+}
+
+/// Write a `ScoreMatrix` as an H5AD whose `X` is the preserved UMI counts and
+/// whose `layers/scores` is the float32 posterior matrix (same CSR pattern).
+///
+/// `uns/kaichi/stage` is set to `"scored"` so a downstream `decide` can pick
+/// the model up automatically.
+pub fn write_scored_h5ad(scores: &ScoreMatrix, path: &Path) -> Result<()> {
+    let file = File::create(path)
+        .with_context(|| format!("cannot create H5AD: {}", path.display()))?;
+    write_scalar_str_attr(&file, "encoding-type", "anndata");
+    write_scalar_str_attr(&file, "encoding-version", "0.1.0");
+
+    let n_cells = scores.n_cells();
+    let n_guides = scores.n_guides();
+
+    write_scored_obs(&file, &scores.cell_barcodes)?;
+    write_var(&file, &scores.guide_ids, n_guides)?;
+
+    let umi: &[u32] = scores.umi_counts.values();
+    let data: &[f32] = scores.data.values();
+    let indices: &[u32] = scores.indices.values();
+    let indptr: &[u32] = scores.indptr.values();
+
+    write_csr_arrays(&file, "X", n_cells, n_guides, umi, indices, indptr)?;
+
+    let layers = file.create_group("layers").context("creating /layers")?;
+    write_scalar_str_attr(&layers, "encoding-type", "dict");
+    write_scalar_str_attr(&layers, "encoding-version", "0.1.0");
+    write_csr_arrays(&layers, "scores", n_cells, n_guides, data, indices, indptr)?;
+
+    let params_json = serde_json::to_string(&scores.model_params)
+        .context("serializing model_params")?;
+    write_uns(&file, scores.model.name(), &params_json, "scored", None)?;
+
+    Ok(())
+}
+
+/// Write a `decide` result as an H5AD that preserves the upstream score matrix.
+///
+/// Layout extends `write_h5ad` with `layers/scores`, and stamps the chosen
+/// `min_confidence` into `uns/kaichi`. Use when the caller has the `ScoreMatrix`
+/// in hand (i.e. immediately after `decide`).
+pub fn write_assigned_from_scored(
+    scores: &ScoreMatrix,
+    result: &AssignmentResult,
+    path: &Path,
+    min_confidence: f32,
+) -> Result<()> {
+    let file = File::create(path)
+        .with_context(|| format!("cannot create H5AD: {}", path.display()))?;
+    write_scalar_str_attr(&file, "encoding-type", "anndata");
+    write_scalar_str_attr(&file, "encoding-version", "0.1.0");
+
+    let n_cells = scores.n_cells();
+    let n_guides = scores.n_guides();
+
+    write_obs(&file, &scores.cell_barcodes, result, n_cells)?;
+    write_var(&file, &scores.guide_ids, n_guides)?;
+
+    let umi: &[u32] = scores.umi_counts.values();
+    let data: &[f32] = scores.data.values();
+    let indices: &[u32] = scores.indices.values();
+    let indptr: &[u32] = scores.indptr.values();
+
+    write_csr_arrays(&file, "X", n_cells, n_guides, umi, indices, indptr)?;
+
+    let layers = file.create_group("layers").context("creating /layers")?;
+    write_scalar_str_attr(&layers, "encoding-type", "dict");
+    write_scalar_str_attr(&layers, "encoding-version", "0.1.0");
+    write_csr_arrays(&layers, "scores", n_cells, n_guides, data, indices, indptr)?;
+    write_csr_group(&layers, "assigned", &result.assigned_x, n_cells, n_guides)?;
+
+    let params_json = serde_json::to_string(&scores.model_params)
+        .context("serializing model_params")?;
+    write_uns(
+        &file,
+        scores.model.name(),
+        &params_json,
+        "assigned",
+        Some(min_confidence),
+    )?;
+
+    Ok(())
+}
+
+/// obs group for a scored (pre-decide) H5AD: just the cell index, no
+/// assignment columns yet.
+fn write_scored_obs(file: &File, cell_barcodes: &StringArray) -> Result<()> {
+    let obs = file.create_group("obs").context("creating /obs")?;
+    write_scalar_str_attr(&obs, "encoding-type", "dataframe");
+    write_scalar_str_attr(&obs, "encoding-version", "0.2.0");
+    write_scalar_str_attr(&obs, "_index", "_index");
+    let empty: Array1<f64> = Array1::zeros(0);
+    obs.new_attr_builder().with_data(&empty).create("column-order")
+        .context("writing obs column-order attr")?;
+    write_str_dataset(&obs, "_index", cell_barcodes)?;
     Ok(())
 }
 
@@ -57,7 +156,7 @@ pub fn write_h5ad(
 // obs
 // ---------------------------------------------------------------------------
 
-fn write_obs(file: &File, input: &LoadedInput, result: &AssignmentResult, n_cells: usize) -> Result<()> {
+fn write_obs(file: &File, cell_barcodes: &StringArray, result: &AssignmentResult, n_cells: usize) -> Result<()> {
     let obs = file.create_group("obs").context("creating /obs")?;
     write_scalar_str_attr(&obs, "encoding-type", "dataframe");
     write_scalar_str_attr(&obs, "encoding-version", "0.2.0");
@@ -67,7 +166,7 @@ fn write_obs(file: &File, input: &LoadedInput, result: &AssignmentResult, n_cell
     ]);
 
     // /obs/_index — cell barcodes
-    write_str_dataset(&obs, "_index", &input.covariates.cell_barcodes)?;
+    write_str_dataset(&obs, "_index", cell_barcodes)?;
 
     let batch = &result.batch;
 
@@ -141,7 +240,7 @@ fn write_obs(file: &File, input: &LoadedInput, result: &AssignmentResult, n_cell
 // var
 // ---------------------------------------------------------------------------
 
-fn write_var(file: &File, input: &LoadedInput, n_guides: usize) -> Result<()> {
+fn write_var(file: &File, guide_ids: &StringArray, n_guides: usize) -> Result<()> {
     let var = file.create_group("var").context("creating /var")?;
     write_scalar_str_attr(&var, "encoding-type", "dataframe");
     write_scalar_str_attr(&var, "encoding-version", "0.2.0");
@@ -151,7 +250,7 @@ fn write_var(file: &File, input: &LoadedInput, n_guides: usize) -> Result<()> {
     var.new_attr_builder().with_data(&empty).create("column-order")
         .context("writing var column-order attr")?;
 
-    write_str_dataset(&var, "_index", &input.guide_metadata.guide_ids)?;
+    write_str_dataset(&var, "_index", guide_ids)?;
     let _ = n_guides; // validated implicitly via guide_ids length
     Ok(())
 }
@@ -198,11 +297,55 @@ where
     Ok(())
 }
 
+/// Variant that takes raw slices instead of a `CsrMatrix`. Used by the score
+/// writers, which already hold their CSR arrays in Arrow buffers.
+fn write_csr_arrays<T>(
+    parent: &Group,
+    name: &str,
+    n_rows: usize,
+    n_cols: usize,
+    data: &[T],
+    indices: &[u32],
+    indptr: &[u32],
+) -> Result<()>
+where
+    T: hdf5::H5Type + Copy,
+{
+    let grp = parent.create_group(name)
+        .with_context(|| format!("creating group {name}"))?;
+    write_scalar_str_attr(&grp, "encoding-type", "csr_matrix");
+    write_scalar_str_attr(&grp, "encoding-version", "0.1.0");
+
+    let shape = arr1(&[n_rows as i64, n_cols as i64]);
+    grp.new_attr_builder().with_data(&shape).create("shape")
+        .context("writing shape attr")?;
+
+    let data_arr = Array1::from_vec(data.to_vec());
+    grp.new_dataset_builder().deflate(3).with_data(&data_arr).create("data")
+        .with_context(|| format!("{name}/data"))?;
+
+    let idx_arr: Array1<i32> = indices.iter().map(|&c| c as i32).collect();
+    grp.new_dataset_builder().deflate(3).with_data(&idx_arr).create("indices")
+        .with_context(|| format!("{name}/indices"))?;
+
+    let iptr_arr: Array1<i32> = indptr.iter().map(|&o| o as i32).collect();
+    grp.new_dataset_builder().deflate(3).with_data(&iptr_arr).create("indptr")
+        .with_context(|| format!("{name}/indptr"))?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // uns
 // ---------------------------------------------------------------------------
 
-fn write_uns(file: &File, model_name: &str, model_params_json: &str) -> Result<()> {
+fn write_uns(
+    file: &File,
+    model_name: &str,
+    model_params_json: &str,
+    stage: &str,
+    min_confidence: Option<f32>,
+) -> Result<()> {
     let uns = file.create_group("uns").context("creating /uns")?;
     write_scalar_str_attr(&uns, "encoding-type", "dict");
     write_scalar_str_attr(&uns, "encoding-version", "0.1.0");
@@ -213,7 +356,14 @@ fn write_uns(file: &File, model_name: &str, model_params_json: &str) -> Result<(
 
     write_scalar_str_dataset(&kaichi, "model", model_name)?;
     write_scalar_str_dataset(&kaichi, "model_params", model_params_json)?;
+    write_scalar_str_dataset(&kaichi, "stage", stage)?;
     write_scalar_str_dataset(&kaichi, "version", env!("CARGO_PKG_VERSION"))?;
+
+    if let Some(mc) = min_confidence {
+        let arr: Array1<f32> = Array1::from_vec(vec![mc]);
+        kaichi.new_dataset_builder().with_data(&arr).create("min_confidence")
+            .context("writing min_confidence")?;
+    }
 
     Ok(())
 }
@@ -602,6 +752,173 @@ mod tests {
         let ds = file.dataset("obs/guide_identity").unwrap();
         let vals: Vec<VarLenUnicode> = ds.read_raw::<VarLenUnicode>().unwrap();
         assert_eq!(vals[0].as_str(), "gA", "multi-infected cell should write best guide, not blank");
+    }
+
+    /// 3 cells × 2 guides ScoreMatrix with known data for round-trip tests.
+    fn make_score_fixture() -> ScoreMatrix {
+        use crate::score::ModelKind;
+        use arrow::array::{Float32Array, StringBuilder, UInt32Array};
+
+        // Nonzero pattern (matches input sparsity):
+        //   C1: gA=3 (score 0.1)
+        //   C2: gB=5 (score 0.8)
+        //   C3: gA=2 (score 0.95), gB=7 (score 0.97)
+        let data = Float32Array::from(vec![0.1f32, 0.8, 0.95, 0.97]);
+        let umi_counts = UInt32Array::from(vec![3u32, 5, 2, 7]);
+        let indices = UInt32Array::from(vec![0u32, 1, 0, 1]);
+        let indptr = UInt32Array::from(vec![0u32, 1, 2, 4]);
+
+        let mut bc = StringBuilder::new();
+        ["C1", "C2", "C3"].iter().for_each(|s| bc.append_value(s));
+        let mut gd = StringBuilder::new();
+        ["gA", "gB"].iter().for_each(|s| gd.append_value(s));
+
+        ScoreMatrix {
+            data,
+            umi_counts,
+            indices,
+            indptr,
+            cell_barcodes: bc.finish(),
+            guide_ids: gd.finish(),
+            model: ModelKind::PoissonGauss,
+            model_params: serde_json::json!({"min_confidence": 0.8, "alpha": 1.5}),
+        }
+    }
+
+    #[test]
+    fn scored_h5ad_roundtrip_recovers_score_matrix() {
+        use crate::io::read::read_scored_h5ad;
+        let scores = make_score_fixture();
+        let tmp = tmp_h5ad();
+        write_scored_h5ad(&scores, tmp.path()).unwrap();
+
+        let loaded = read_scored_h5ad(tmp.path()).unwrap();
+        assert_eq!(loaded.n_cells(), scores.n_cells());
+        assert_eq!(loaded.n_guides(), scores.n_guides());
+        assert_eq!(loaded.nnz(), scores.nnz());
+        assert_eq!(loaded.data.values(), scores.data.values());
+        assert_eq!(loaded.umi_counts.values(), scores.umi_counts.values());
+        assert_eq!(loaded.indices.values(), scores.indices.values());
+        assert_eq!(loaded.indptr.values(), scores.indptr.values());
+        assert_eq!(loaded.model.name(), "poisson_gauss");
+        assert_eq!(loaded.model_params, scores.model_params);
+        assert_eq!(loaded.cell_barcodes.value(0), "C1");
+        assert_eq!(loaded.guide_ids.value(1), "gB");
+    }
+
+    #[test]
+    fn scored_h5ad_writes_uns_stage_scored() {
+        let scores = make_score_fixture();
+        let tmp = tmp_h5ad();
+        write_scored_h5ad(&scores, tmp.path()).unwrap();
+
+        let file = hdf5::File::open(tmp.path()).unwrap();
+        let ds = file.dataset("uns/kaichi/stage").unwrap();
+        let vals: Vec<VarLenUnicode> = ds.read_raw::<VarLenUnicode>().unwrap();
+        assert_eq!(vals[0].as_str(), "scored");
+    }
+
+    #[test]
+    fn scored_h5ad_x_holds_umi_counts_not_scores() {
+        // Sanity: X stores raw UMI counts (uint), scores live in the layer.
+        let scores = make_score_fixture();
+        let tmp = tmp_h5ad();
+        write_scored_h5ad(&scores, tmp.path()).unwrap();
+
+        let file = hdf5::File::open(tmp.path()).unwrap();
+        let x_data: Vec<u32> = file.dataset("X/data").unwrap().read_raw::<u32>().unwrap();
+        let s_data: Vec<f32> = file.dataset("layers/scores/data").unwrap().read_raw::<f32>().unwrap();
+        assert_eq!(x_data, vec![3, 5, 2, 7]);
+        assert!((s_data[0] - 0.1).abs() < 1e-6);
+        assert!((s_data[3] - 0.97).abs() < 1e-6);
+    }
+
+    #[test]
+    fn assigned_from_scored_writes_all_three_groups() {
+        let scores = make_score_fixture();
+        // Build a fake AssignmentResult with the right shape (3 cells × 2 guides).
+        // Build a 3×2 AssignmentResult to match the 3-cell score fixture.
+        let assigned = CsrMatrix::try_from_csr_data(
+            3, 2,
+            vec![0, 0, 0, 1],
+            vec![0],
+            vec![1u8],
+        ).unwrap();
+
+        use crate::schema::assignment_schema_ref;
+        use arrow::array::{
+            BooleanBuilder, DictionaryArray, Float32Builder, StringArray as SA,
+            StringDictionaryBuilder, UInt32Builder, UInt8Builder,
+        };
+        use arrow::datatypes::Int16Type;
+        let model_val = SA::from(vec!["poisson_gauss"]);
+        let model_dict = DictionaryArray::try_new(
+            arrow::array::Int8Array::from(vec![0i8; 3]),
+            Arc::new(model_val),
+        ).unwrap();
+        let mut g: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
+        g.append_null(); g.append_null(); g.append_value("gA");
+        let mut tg: StringDictionaryBuilder<Int16Type> = StringDictionaryBuilder::new();
+        for _ in 0..3 { tg.append_null(); }
+        let mut u = UInt32Builder::new();
+        u.append_null(); u.append_null(); u.append_value(2);
+        let mut c = Float32Builder::new();
+        c.append_null(); c.append_null(); c.append_value(0.95);
+        let mut iu = BooleanBuilder::new();
+        iu.append_value(true); iu.append_value(true); iu.append_value(false);
+        let mut im = BooleanBuilder::new();
+        for _ in 0..3 { im.append_value(false); }
+        let mut nd = UInt8Builder::new();
+        nd.append_value(0); nd.append_value(0); nd.append_value(1);
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            assignment_schema_ref(),
+            vec![
+                Arc::new(SA::from(vec!["C1", "C2", "C3"])),
+                Arc::new(g.finish()),
+                Arc::new(tg.finish()),
+                Arc::new(u.finish()),
+                Arc::new(c.finish()),
+                Arc::new(model_dict),
+                Arc::new(iu.finish()),
+                Arc::new(im.finish()),
+                Arc::new(nd.finish()),
+            ],
+        ).unwrap();
+        let result = AssignmentResult { batch, assigned_x: assigned };
+
+        let tmp = tmp_h5ad();
+        write_assigned_from_scored(&scores, &result, tmp.path(), 0.8).unwrap();
+
+        let file = hdf5::File::open(tmp.path()).unwrap();
+        assert!(file.group("X").is_ok(), "X group missing");
+        assert!(file.group("layers/scores").is_ok(), "layers/scores missing");
+        assert!(file.group("layers/assigned").is_ok(), "layers/assigned missing");
+
+        let stage: Vec<VarLenUnicode> = file.dataset("uns/kaichi/stage").unwrap()
+            .read_raw::<VarLenUnicode>().unwrap();
+        assert_eq!(stage[0].as_str(), "assigned");
+        let mc: Vec<f32> = file.dataset("uns/kaichi/min_confidence").unwrap()
+            .read_raw::<f32>().unwrap();
+        assert!((mc[0] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn read_scored_h5ad_rejects_plain_assigned_h5ad() {
+        // A regular write_h5ad output has no layers/scores and should be rejected.
+        use crate::io::read::read_scored_h5ad;
+        let (input, result) = make_write_fixture();
+        let tmp = tmp_h5ad();
+        write_h5ad(&input, &result, tmp.path(), "poisson_gauss", "{}").unwrap();
+        let err = match read_scored_h5ad(tmp.path()) {
+            Ok(_) => panic!("expected error for h5ad without scores layer"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("scores") || msg.contains("kaichi-scored"),
+            "expected mention of missing scores layer; got: {msg}"
+        );
     }
 
     #[test]

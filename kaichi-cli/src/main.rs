@@ -1,5 +1,7 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use kaichi_core::models::{em_count_mixture::decide_threshold, TwoStage};
+use kaichi_core::score::ScoreMatrix;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -14,7 +16,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Assign CRISPR guides to cells
+    /// Assign CRISPR guides to cells (one-shot: score + decide)
     Assign {
         /// Input: guide-count H5AD
         #[arg(long)]
@@ -25,6 +27,47 @@ enum Commands {
         /// Output path (.h5ad or .csv)
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Number of worker threads. 0 = half of logical cores.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+    },
+    /// Fit a two-stage model and cache the score matrix to an H5AD.
+    ///
+    /// Output H5AD layout: X = preserved UMI counts, layers/scores = float32
+    /// posteriors, uns/kaichi tracks model name and fitted params. Reject
+    /// single-stage models (umi/ratio/max) — use `assign` for those.
+    Score {
+        /// Input: guide-count H5AD
+        #[arg(long)]
+        counts: PathBuf,
+        /// Two-stage model: poisson_gauss, poisson, neg_binomial, binomial
+        #[arg(long, default_value = "poisson_gauss")]
+        model: String,
+        /// Output: scored H5AD
+        #[arg(long)]
+        output: PathBuf,
+        /// Number of worker threads. 0 = half of logical cores.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+    },
+    /// Threshold a cached score H5AD into final assignments.
+    ///
+    /// Model identity and fitted params are pulled from uns/kaichi. Output
+    /// extends the input with a `layers/assigned` group plus assignment obs
+    /// columns; `--in-place` overwrites the input file.
+    Decide {
+        /// Input: scored H5AD (from `kaichi score`)
+        #[arg(long)]
+        scores: PathBuf,
+        /// Posterior threshold in [0, 1]
+        #[arg(long)]
+        min_confidence: f32,
+        /// Output H5AD path (mutually exclusive with --in-place)
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Overwrite the input scored H5AD with the decided result
+        #[arg(long, default_value_t = false, conflicts_with = "output")]
+        in_place: bool,
         /// Number of worker threads. 0 = half of logical cores.
         #[arg(long, default_value_t = 0)]
         threads: usize,
@@ -47,12 +90,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Assign { counts, model, output, threads } => {
-            let n_threads = resolve_threads(threads);
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(n_threads)
-                .build_global()
-                .map_err(|e| anyhow::anyhow!("rayon thread pool init failed: {e}"))?;
-            eprintln!("using {n_threads} thread(s)");
+            init_threads(threads)?;
             eprintln!("reading {}", counts.display());
             let t0 = Instant::now();
             let input = kaichi_core::io::read::read_h5ad(&counts)?;
@@ -82,8 +120,94 @@ fn main() -> Result<()> {
                 eprintln!("wrote {}", out_path.display());
             }
         }
+        Commands::Score { counts, model, output, threads } => {
+            init_threads(threads)?;
+            eprintln!("reading {}", counts.display());
+            let t0 = Instant::now();
+            let input = kaichi_core::io::read::read_h5ad(&counts)?;
+            eprintln!(
+                "loaded {} cells × {} guides ({} nnz) in {:.2}s",
+                input.counts.n_cells,
+                input.counts.n_guides,
+                input.counts.nnz(),
+                t0.elapsed().as_secs_f64()
+            );
+
+            eprintln!("scoring with model: {model}");
+            let t1 = Instant::now();
+            let scores = score_model(&model, &input)?;
+            eprintln!("scored {} cells in {:.2}s", scores.n_cells(), t1.elapsed().as_secs_f64());
+
+            kaichi_core::io::write::write_scored_h5ad(&scores, &output)?;
+            eprintln!("wrote {}", output.display());
+        }
+        Commands::Decide { scores, min_confidence, output, in_place, threads } => {
+            init_threads(threads)?;
+            let out_path = match (output, in_place) {
+                (Some(p), false) => p,
+                (None, true) => scores.clone(),
+                (None, false) => bail!("must specify --output PATH or --in-place"),
+                (Some(_), true) => unreachable!("clap enforces mutual exclusion"),
+            };
+
+            eprintln!("reading {}", scores.display());
+            let t0 = Instant::now();
+            let score_matrix = kaichi_core::io::read::read_scored_h5ad(&scores)?;
+            eprintln!(
+                "loaded {} cells × {} guides ({} nnz, model={}) in {:.2}s",
+                score_matrix.n_cells(),
+                score_matrix.n_guides(),
+                score_matrix.nnz(),
+                score_matrix.model.name(),
+                t0.elapsed().as_secs_f64()
+            );
+
+            eprintln!("deciding at min_confidence={min_confidence}");
+            let t1 = Instant::now();
+            let result = decide_threshold(&score_matrix, min_confidence)?;
+            eprintln!("decided {} cells in {:.2}s", result.batch.num_rows(), t1.elapsed().as_secs_f64());
+
+            kaichi_core::io::write::write_assigned_from_scored(
+                &score_matrix, &result, &out_path, min_confidence,
+            )?;
+            eprintln!("wrote {}", out_path.display());
+        }
     }
     Ok(())
+}
+
+fn init_threads(requested: usize) -> Result<()> {
+    let n_threads = resolve_threads(requested);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build_global()
+        .map_err(|e| anyhow::anyhow!("rayon thread pool init failed: {e}"))?;
+    eprintln!("using {n_threads} thread(s)");
+    Ok(())
+}
+
+/// Two-stage models only. Single-stage models (umi/ratio/max) fail with a
+/// clear pointer to `assign`.
+fn score_model(name: &str, input: &kaichi_core::data::LoadedInput) -> Result<ScoreMatrix> {
+    use kaichi_core::models::{
+        binomial::BinomialModel, neg_binomial::NegBinomialModel,
+        poisson::PoissonModel, poisson_gauss::PoissonGaussModel,
+    };
+    let scores = match name {
+        "poisson_gauss" => PoissonGaussModel::default().score(input)?,
+        "poisson"       => PoissonModel::default().score(input)?,
+        "neg_binomial"  => NegBinomialModel::default().score(input)?,
+        "binomial"      => BinomialModel::default().score(input)?,
+        "umi" | "ratio" | "max" => bail!(
+            "model {name:?} is single-stage and does not support `score`. \
+             Use `kaichi assign` instead."
+        ),
+        other => bail!(
+            "unknown model: {other}. Two-stage models: poisson_gauss, poisson, \
+             neg_binomial, binomial"
+        ),
+    };
+    Ok(scores)
 }
 
 fn run_model(

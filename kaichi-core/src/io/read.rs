@@ -1,6 +1,7 @@
 use crate::data::{BatchLabels, CountMatrix, Covariates, GuideMetadata, LoadedInput};
-use anyhow::{bail, Context, Result};
-use arrow::array::StringBuilder;
+use crate::score::{ModelKind, ScoreMatrix};
+use anyhow::{anyhow, bail, Context, Result};
+use arrow::array::{Float32Array, StringArray, StringBuilder, UInt32Array};
 use hdf5::{types::VarLenUnicode, File};
 use std::path::Path;
 
@@ -57,6 +58,93 @@ pub fn read_h5ad(path: &Path) -> Result<LoadedInput> {
             guide_ids: guide_builder.finish(),
         },
     })
+}
+
+/// Read a "scored" H5AD (produced by `write_scored_h5ad`) back into a
+/// `ScoreMatrix`.
+///
+/// Expects:
+/// - `/X`              CSR uint32 (UMI counts)
+/// - `/layers/scores`  CSR float32 (posteriors, same indices/indptr as X)
+/// - `/uns/kaichi/model`        model name (round-trip identity)
+/// - `/uns/kaichi/model_params` JSON blob (fitted params)
+///
+/// `uns/kaichi/stage` is *not* checked — by user request, `decide` tolerates
+/// any H5AD that has a `scores` layer.
+pub fn read_scored_h5ad(path: &Path) -> Result<ScoreMatrix> {
+    let file = File::open(path)
+        .with_context(|| format!("cannot open H5AD: {}", path.display()))?;
+
+    let cell_barcodes_raw = read_index(&file, "obs").context("reading obs index")?;
+    let guide_ids_raw = read_index(&file, "var").context("reading var index")?;
+    let n_cells = cell_barcodes_raw.len();
+
+    let (x_indptr, x_indices, umi_values) = read_csr_x(&file, n_cells)
+        .context("reading X (umi counts)")?;
+
+    // Read float32 scores from /layers/scores.
+    let scores_grp = file.group("layers/scores")
+        .context("missing /layers/scores — file is not a kaichi-scored h5ad")?;
+    let s_indices: Vec<i32> = scores_grp.dataset("indices")
+        .context("missing layers/scores/indices")?
+        .read_raw::<i32>().context("reading layers/scores/indices")?;
+    let s_indptr: Vec<i32> = scores_grp.dataset("indptr")
+        .context("missing layers/scores/indptr")?
+        .read_raw::<i32>().context("reading layers/scores/indptr")?;
+    let s_data: Vec<f32> = scores_grp.dataset("data")
+        .context("missing layers/scores/data")?
+        .read_raw::<f32>().context("reading layers/scores/data")?;
+
+    if s_indptr.len() != x_indptr.len()
+        || s_indices.len() != x_indices.len()
+        || s_data.len() != umi_values.len()
+    {
+        bail!(
+            "scores layer shape mismatch: X has nnz={}, indptr len={}; \
+             scores has nnz={}, indptr len={}",
+            umi_values.len(), x_indptr.len(),
+            s_data.len(), s_indptr.len()
+        );
+    }
+
+    // Pull model name + params from uns/kaichi.
+    let kaichi = file.group("uns/kaichi")
+        .context("missing /uns/kaichi — file was not written by kaichi")?;
+    let model_name: VarLenUnicode = kaichi.dataset("model")
+        .context("missing uns/kaichi/model")?
+        .read_raw::<VarLenUnicode>()?
+        .into_iter().next()
+        .ok_or_else(|| anyhow!("uns/kaichi/model is empty"))?;
+    let params_str: VarLenUnicode = kaichi.dataset("model_params")
+        .context("missing uns/kaichi/model_params")?
+        .read_raw::<VarLenUnicode>()?
+        .into_iter().next()
+        .ok_or_else(|| anyhow!("uns/kaichi/model_params is empty"))?;
+
+    let model = ModelKind::from_name(model_name.as_str())
+        .ok_or_else(|| anyhow!("uns/kaichi/model = {:?} is not a known kaichi model", model_name.as_str()))?;
+    let model_params: serde_json::Value = serde_json::from_str(params_str.as_str())
+        .with_context(|| format!("uns/kaichi/model_params is not valid JSON: {:?}", params_str.as_str()))?;
+
+    let cell_barcodes = string_array_from_vlu(&cell_barcodes_raw);
+    let guide_ids = string_array_from_vlu(&guide_ids_raw);
+
+    Ok(ScoreMatrix {
+        data: Float32Array::from(s_data),
+        umi_counts: UInt32Array::from(umi_values),
+        indices: UInt32Array::from(x_indices.into_iter().map(|i| i as u32).collect::<Vec<u32>>()),
+        indptr: UInt32Array::from(x_indptr.into_iter().map(|i| i as u32).collect::<Vec<u32>>()),
+        cell_barcodes,
+        guide_ids,
+        model,
+        model_params,
+    })
+}
+
+fn string_array_from_vlu(v: &[VarLenUnicode]) -> StringArray {
+    let mut b = StringBuilder::with_capacity(v.len(), v.iter().map(|s| s.len()).sum());
+    for s in v { b.append_value(s.as_str()); }
+    b.finish()
 }
 
 /// Read `obs/batch` if present; otherwise return a single-batch fallback.

@@ -31,6 +31,23 @@ impl ModelKind {
             Self::Max => "max",
         }
     }
+
+    /// Inverse of `name()`. Used when reconstructing a `ScoreMatrix` from disk.
+    pub fn from_name(s: &str) -> Option<Self> {
+        Some(match s {
+            "poisson_gauss" => Self::PoissonGauss,
+            "poisson"       => Self::Poisson,
+            "neg_binomial"  => Self::NegBinomial,
+            "binomial"      => Self::Binomial,
+            "beta2"         => Self::Beta2,
+            "beta3"         => Self::Beta3,
+            "quantiles"     => Self::Quantiles,
+            "umi"           => Self::Umi,
+            "ratio"         => Self::Ratio,
+            "max"           => Self::Max,
+            _ => return None,
+        })
+    }
 }
 
 /// Sparse CSR score matrix produced by the scoring stage.
