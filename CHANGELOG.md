@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`kaichi.to_anndata(scores, decisions=None)`** Python helper. Two modes:
+  with just `scores` it returns a "scored" AnnData (`X` = preserved UMI
+  counts, `layers["scores"]` = float32 posteriors); with `decisions` it
+  matches `assign()`'s output shape (adds `layers["assigned"]`, per-cell
+  `obs` columns, and `min_confidence` in `uns["kaichi"]`).
+- **`decide()` stamps `min_confidence` into the returned RecordBatch's
+  schema metadata** (`kaichi.min_confidence`). `to_anndata` reads it back
+  so callers don't pass the threshold through twice.
+- **Four individual Arrow array getters on `PyScoreResult`:**
+  `scores_data` (float32), `umi_counts` (uint32), `indices` (uint32),
+  `indptr` (uint32). All zero-copy.
+
+### Changed
+
+- `PyScoreResult` Arrow getters return native `pyarrow.Array` (via
+  `pyo3_arrow::PyArray::to_pyarrow`) instead of `arro3` types, removing an
+  implicit dependency on the `arro3` package.
+
+### Removed
+
+- `PyScoreResult.values_csr` and `umi_csr`. They returned an Arrow
+  `RecordBatch`, but Arrow batches require equal-length columns, and the
+  three CSR components have different lengths (`data`/`indices` at `nnz`,
+  `indptr` at `n_cells + 1`). These getters were non-functional in 0.2.0
+  and never exercised by any caller. Use the four individual array getters
+  (`scores_data`, `umi_counts`, `indices`, `indptr`) instead.
+
 ## [0.2.0] — 2026-05-24
 
 ### Added

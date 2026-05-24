@@ -37,6 +37,9 @@ adata = kaichi.assign("gRNA_counts.h5ad", model="poisson_gauss")
 scores = kaichi.score("gRNA_counts.h5ad", model="poisson_gauss")
 strict = kaichi.decide(scores, min_confidence=0.9)   # pyarrow.RecordBatch
 lenient = kaichi.decide(scores, min_confidence=0.7)  # reuses cached scores
+
+# Drop the chosen one into a scanpy-shaped AnnData when you're done.
+adata = kaichi.to_anndata(scores, strict)
 ```
 
 `adata` is a standard `anndata.AnnData` you can drop into a scanpy workflow:
@@ -84,7 +87,24 @@ single-stage models (`umi`, `ratio`, `max`) — use `assign()` for those.
 
 Apply a confidence threshold to a cached `ScoreResult`. Returns a
 `pyarrow.RecordBatch` with one row per cell. Call multiple times with different
-thresholds without re-fitting.
+thresholds without re-fitting. The chosen `min_confidence` is stamped into the
+batch's schema metadata so `to_anndata` can recover it automatically.
+
+### `kaichi.to_anndata(scores, decisions=None)`
+
+Materialize a `ScoreResult` (and optional decisions) as an `anndata.AnnData`,
+matching `assign()`'s output shape:
+
+- `to_anndata(scores)` — `.X` = preserved UMI counts, `.layers["scores"]` =
+  float32 posteriors. Useful for inspecting posteriors before picking a
+  threshold.
+- `to_anndata(scores, decisions)` — additionally adds `.layers["assigned"]`
+  (binary mask), the per-cell assignment columns in `.obs`, and stamps
+  `min_confidence` into `.uns["kaichi"]`.
+
+Use this when you want a scanpy-ready object. If you're calling `decide()` in
+a tight loop and only need the raw assignment table, work with the
+`RecordBatch` directly — it's cheaper.
 
 ### `.obs` / output columns
 

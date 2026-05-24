@@ -26,8 +26,6 @@ use kaichi_core::models::{
 use kaichi_core::score::ScoreMatrix;
 
 use arrow::array::Array as _;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
@@ -50,37 +48,44 @@ pub struct PyScoreResult {
 
 #[pymethods]
 impl PyScoreResult {
-    /// The three CSR arrays as an Arrow RecordBatch (zero-copy via PyCapsule).
-    /// Schema: data Float32, indices UInt32, indptr UInt32.
+    /// Float32 posterior scores, one per nonzero entry. Length = nnz.
     #[getter]
-    fn values_csr(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("data", DataType::Float32, false),
-            Field::new("indices", DataType::UInt32, false),
-            Field::new("indptr", DataType::UInt32, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(self.inner.data.clone()) as Arc<dyn arrow::array::Array>,
-                Arc::new(self.inner.indices.clone()),
-                Arc::new(self.inner.indptr.clone()),
-            ],
-        )
-        .map_err(|e| PyValueError::new_err(format!("values_csr: {e}")))?;
-        PyRecordBatch::new(batch).to_pyarrow(py)
+    fn scores_data(&self, py: Python<'_>) -> PyResult<PyObject> {
+        use pyo3_arrow::PyArray;
+        PyArray::from_array_ref(Arc::new(self.inner.data.clone())).to_pyarrow(py)
+    }
+
+    /// Preserved UMI counts, parallel to `scores_data`. Length = nnz.
+    #[getter]
+    fn umi_counts(&self, py: Python<'_>) -> PyResult<PyObject> {
+        use pyo3_arrow::PyArray;
+        PyArray::from_array_ref(Arc::new(self.inner.umi_counts.clone())).to_pyarrow(py)
+    }
+
+    /// CSR column indices (guide index for each nonzero entry). Length = nnz.
+    #[getter]
+    fn indices(&self, py: Python<'_>) -> PyResult<PyObject> {
+        use pyo3_arrow::PyArray;
+        PyArray::from_array_ref(Arc::new(self.inner.indices.clone())).to_pyarrow(py)
+    }
+
+    /// CSR row pointers. Length = n_cells + 1.
+    #[getter]
+    fn indptr(&self, py: Python<'_>) -> PyResult<PyObject> {
+        use pyo3_arrow::PyArray;
+        PyArray::from_array_ref(Arc::new(self.inner.indptr.clone())).to_pyarrow(py)
     }
 
     #[getter]
     fn cell_barcodes(&self, py: Python<'_>) -> PyResult<PyObject> {
         use pyo3_arrow::PyArray;
-        PyArray::from_array_ref(Arc::new(self.inner.cell_barcodes.clone())).to_arro3(py)
+        PyArray::from_array_ref(Arc::new(self.inner.cell_barcodes.clone())).to_pyarrow(py)
     }
 
     #[getter]
     fn guide_ids(&self, py: Python<'_>) -> PyResult<PyObject> {
         use pyo3_arrow::PyArray;
-        PyArray::from_array_ref(Arc::new(self.inner.guide_ids.clone())).to_arro3(py)
+        PyArray::from_array_ref(Arc::new(self.inner.guide_ids.clone())).to_pyarrow(py)
     }
 
     /// (n_cells, n_guides)

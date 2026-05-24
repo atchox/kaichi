@@ -11,10 +11,18 @@ use crate::models::em::run_em;
 use crate::models::output::{n_detected_u8, AssignmentOutputBuilder};
 use crate::score::ScoreMatrix;
 
-use anyhow::Result;
-use arrow::array::{Float32Array, UInt32Array};
+use anyhow::{Context, Result};
+use arrow::array::{Float32Array, RecordBatch, UInt32Array};
+use arrow::datatypes::Schema;
 use rayon::prelude::*;
 use serde_json::Value;
+use std::collections::HashMap;
+
+/// Schema-metadata key used by `decide_threshold` to stamp the threshold onto
+/// the returned RecordBatch. Python's `kaichi.to_anndata` reads this back to
+/// populate `uns["kaichi"]["min_confidence"]` without forcing the caller to
+/// repeat the threshold value.
+pub const MIN_CONFIDENCE_META_KEY: &str = "kaichi.min_confidence";
 
 // ---------------------------------------------------------------------------
 // Supporting types
@@ -267,5 +275,22 @@ pub fn decide_threshold(scores: &ScoreMatrix, min_confidence: f32) -> Result<Ass
         }
     }
 
-    out.finish(&scores.cell_barcodes, true)
+    let mut result = out.finish(&scores.cell_barcodes, true)?;
+
+    // Stamp min_confidence into the batch schema metadata so downstream
+    // consumers (notably the Python to_anndata helper) can recover the
+    // threshold without the caller passing it through twice.
+    let mut metadata: HashMap<String, String> = result.batch.schema().metadata().clone();
+    metadata.insert(MIN_CONFIDENCE_META_KEY.to_string(), min_confidence.to_string());
+    let new_schema = Schema::new_with_metadata(
+        result.batch.schema().fields().clone(),
+        metadata,
+    );
+    result.batch = RecordBatch::try_new(
+        std::sync::Arc::new(new_schema),
+        result.batch.columns().to_vec(),
+    )
+    .context("rebuilding decide batch with metadata")?;
+
+    Ok(result)
 }

@@ -35,7 +35,7 @@ from . import _native
 # Re-export the Rust class under the public name ScoreResult.
 ScoreResult = _native.PyScoreResult
 
-__all__ = ["assign", "score", "decide", "ScoreResult", "__version__"]
+__all__ = ["assign", "score", "decide", "to_anndata", "ScoreResult", "__version__"]
 
 
 def assign(
@@ -191,6 +191,98 @@ def decide(
     pyarrow.RecordBatch
         One row per cell with columns: ``cell_barcode``, ``guide_id``,
         ``assignment_confidence``, ``umi_count``, ``is_unassigned``,
-        ``is_multi_infected``, ``n_guides_detected``.
+        ``is_multi_infected``, ``n_guides_detected``. ``min_confidence`` is
+        stamped into the schema metadata so :func:`to_anndata` can recover it
+        without the caller passing it through twice.
     """
-    return _native._decide(scores, min_confidence)
+    batch = _native._decide(scores, min_confidence)
+    # pyo3-arrow 0.5 doesn't preserve schema metadata across PyCapsule
+    # transit, so stamp it here instead. (The Rust side also stamps it for
+    # the CLI path, which uses the RecordBatch in-process.)
+    existing = batch.schema.metadata or {}
+    new_meta = {**existing, b"kaichi.min_confidence": str(min_confidence).encode("utf-8")}
+    return batch.replace_schema_metadata(new_meta)
+
+
+def to_anndata(
+    scores: ScoreResult,
+    decisions: pa.RecordBatch | None = None,
+) -> anndata.AnnData:
+    """Materialize a :class:`ScoreResult` (optionally with decisions) as an AnnData.
+
+    Two modes:
+
+    - ``to_anndata(scores)`` returns a "scored" AnnData with ``X`` = preserved
+      UMI counts and ``layers["scores"]`` = float32 posteriors.
+    - ``to_anndata(scores, decisions)`` additionally attaches
+      ``layers["assigned"]`` (binary CSR) and the per-cell assignment columns
+      from ``decisions``. ``min_confidence`` is recovered automatically from
+      the RecordBatch schema metadata stamped by :func:`decide`.
+
+    Parameters
+    ----------
+    scores :
+        The output of :func:`score`.
+    decisions :
+        Optional output of :func:`decide`. When omitted, the returned AnnData
+        is in the "scored" stage (no assignment layer or obs columns).
+
+    Returns
+    -------
+    anndata.AnnData
+        Same shape and conventions as :func:`assign`'s output when
+        ``decisions`` is supplied.
+    """
+    n_cells, n_guides = scores.shape
+
+    # Pull the four CSR arrays out of the Rust-owned ScoreResult.
+    scores_data = np.asarray(pa.array(scores.scores_data))
+    umi_data = np.asarray(pa.array(scores.umi_counts))
+    indices = np.asarray(pa.array(scores.indices))
+    indptr = np.asarray(pa.array(scores.indptr))
+
+    X = sp.csr_matrix((umi_data, indices, indptr), shape=(n_cells, n_guides))
+    scores_layer = sp.csr_matrix(
+        (scores_data, indices.copy(), indptr.copy()), shape=(n_cells, n_guides)
+    )
+
+    obs = pd.DataFrame(index=pd.Index(pa.array(scores.cell_barcodes).to_pylist(), name="cell_barcode"))
+    var = pd.DataFrame(index=pd.Index(pa.array(scores.guide_ids).to_pylist(), name="guide_id"))
+    layers: dict[str, Any] = {"scores": scores_layer}
+    uns: dict[str, Any] = {
+        "kaichi": {
+            "model": scores.model,
+            "model_params": scores.model_params,
+            "stage": "scored",
+            "version": __version__,
+        }
+    }
+
+    if decisions is not None:
+        # Build the binary assigned layer from is_unassigned + best guide_id.
+        df = decisions.to_pandas()
+        guide_to_idx = {g: i for i, g in enumerate(var.index)}
+        rows: list[int] = []
+        cols: list[int] = []
+        for i, (gid, unassigned) in enumerate(zip(df["guide_id"], df["is_unassigned"])):
+            if not unassigned and gid is not None and gid in guide_to_idx:
+                rows.append(i)
+                cols.append(guide_to_idx[gid])
+        assigned_data = np.ones(len(rows), dtype=np.uint8)
+        assigned = sp.csr_matrix(
+            (assigned_data, (rows, cols)), shape=(n_cells, n_guides), dtype=np.uint8
+        )
+        layers["assigned"] = assigned
+
+        # Attach per-cell assignment columns to obs (drop cell_barcode — it's the index).
+        obs_cols = df.drop(columns=["cell_barcode"]).set_index(obs.index)
+        obs = obs_cols
+
+        # Recover min_confidence from schema metadata if present.
+        meta = decisions.schema.metadata or {}
+        mc_raw = meta.get(b"kaichi.min_confidence")
+        if mc_raw is not None:
+            uns["kaichi"]["min_confidence"] = float(mc_raw.decode("utf-8"))
+        uns["kaichi"]["stage"] = "assigned"
+
+    return anndata.AnnData(X=X, obs=obs, var=var, layers=layers, uns=uns)
