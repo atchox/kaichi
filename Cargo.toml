@@ -12,6 +12,9 @@ version = "0.2.0"
 edition = "2021"
 authors = ["kaichi contributors"]
 license = "MIT"
+description = "CRISPR guide assignment for Perturb-seq"
+repository = "https://github.com/atchox/kaichi"
+homepage = "https://github.com/atchox/kaichi"
 
 [workspace.dependencies]
 # Arrow

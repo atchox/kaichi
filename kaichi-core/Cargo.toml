@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core library for kaichi: per-guide EM mixture models and zero-copy Arrow output for CRISPR guide assignment"
+keywords = ["crispr", "perturb-seq", "single-cell", "bioinformatics", "genomics"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 arrow = { workspace = true }

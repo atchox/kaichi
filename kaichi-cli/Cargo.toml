@@ -4,13 +4,19 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Command-line interface for kaichi: CRISPR guide assignment for Perturb-seq"
+readme = "README.md"
+keywords = ["crispr", "perturb-seq", "single-cell", "bioinformatics", "genomics"]
+categories = ["science", "command-line-utilities"]
 
 [[bin]]
 name = "kaichi"
 path = "src/main.rs"
 
 [dependencies]
-kaichi-core = { path = "../kaichi-core" }
+kaichi-core = { path = "../kaichi-core", version = "0.2.0" }
 arrow = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
