@@ -469,11 +469,89 @@ mod tests {
     }
 
     #[test]
+    fn nb_posterior_drops_when_depth_doubles() {
+        let p = fp(0.3, -2.0, 2.0, 1.0);
+        let log_d_lo = (10.0_f64 + 1.0).ln();
+        let log_d_hi = (21.0_f64 + 1.0).ln();
+        let y = 4.0;
+        let post_lo = posterior_signal(y, log_d_lo, &p, 0);
+        let post_hi = posterior_signal(y, log_d_hi, &p, 0);
+        assert!(
+            post_hi < post_lo,
+            "doubling depth should lower posterior at fixed y: lo={post_lo}, hi={post_hi}"
+        );
+    }
+
+    #[test]
     fn nb_posterior_uses_batch_gamma() {
         let p = FitParams { pi: 0.3, beta0: -2.0, beta1: 2.0, log_theta: 1.0, gamma: vec![0.0, 1.5] };
         let b0 = posterior_signal(5.0, 0.0, &p, 0);
         let b1 = posterior_signal(5.0, 0.0, &p, 1);
         assert!(b0 > b1, "γ_1 > 0 should suppress signal in batch 1: b0={b0}, b1={b1}");
+    }
+
+    #[test]
+    fn em_recovers_batch_offsets() {
+        use super::super::em::run_em;
+        use super::super::em_count_mixture::GuideData;
+        let log_d = (50.0_f64 + 1.0).ln();
+        let model = NegBinomialModel::default();
+        // Two batches, batch 1 has ~doubled rates ⇒ true γ_1 ≈ ln(2).
+        let mut data: Vec<(f64, f64, u16)> = Vec::new();
+        for i in 0..12 { data.push(((i % 3) as f64, log_d, 0u16)); }
+        for i in 0..8  { data.push((18.0 + i as f64, log_d, 0u16)); }
+        for i in 0..12 { data.push(((i % 3) as f64 + 1.0, log_d, 1u16)); }
+        for i in 0..8  { data.push((36.0 + i as f64, log_d, 1u16)); }
+        let guide_data = GuideData { triples: data.clone(), n_zeros: 0 };
+
+        let mut resp = vec![0.0f64; data.len()];
+        let init = model.init(&guide_data, 2, 0.1);
+        let (fitted, _) = run_em(
+            init,
+            |p| model.em_cycle(p, &guide_data, 2, &mut resp),
+            300,
+            1e-9,
+        );
+
+        assert_eq!(fitted.gamma.len(), 2);
+        assert_eq!(fitted.gamma[0], 0.0, "γ_0 anchored at 0");
+        assert!(
+            fitted.gamma[1] > 0.3,
+            "γ_1 should be positive when batch 1 has elevated rates; got {}",
+            fitted.gamma[1]
+        );
+    }
+
+    #[test]
+    fn em_respects_theta_clamp() {
+        use super::super::em::run_em;
+        use super::super::em_count_mixture::GuideData;
+        let log_d = (50.0_f64 + 1.0).ln();
+        // Tight clamp far from any reasonable MLE for clean bimodal data.
+        let model = NegBinomialModel {
+            theta_init: 0.75,
+            theta_min: 0.5,
+            theta_max: 1.0,
+            ..Default::default()
+        };
+        let mut data: Vec<(f64, f64, u16)> = (0..12).map(|i| ((i % 3) as f64, log_d, 0u16)).collect();
+        data.extend((0..8).map(|i| (18.0 + i as f64, log_d, 0u16)));
+        let guide_data = GuideData { triples: data.clone(), n_zeros: 0 };
+
+        let mut resp = vec![0.0f64; data.len()];
+        let init = model.init(&guide_data, 1, 0.1);
+        let (fitted, _) = run_em(
+            init,
+            |p| model.em_cycle(p, &guide_data, 1, &mut resp),
+            300,
+            1e-9,
+        );
+
+        let theta = fitted.log_theta.exp();
+        assert!(
+            theta >= 0.5 - 1e-9 && theta <= 1.0 + 1e-9,
+            "θ should stay within [0.5, 1.0]; got {theta}"
+        );
     }
 
     #[test]

@@ -460,6 +460,38 @@ mod tests {
     }
 
     #[test]
+    fn em_recovers_batch_offsets() {
+        use super::super::em::run_em;
+        use super::super::em_count_mixture::GuideData;
+        let log_d = (50.0_f64 + 1.0).ln();
+        let model = PoissonModel::default();
+        // Two batches, batch 1 has ~doubled rates ⇒ true γ_1 ≈ ln(2) ≈ 0.69.
+        let mut data: Vec<(f64, f64, u16)> = Vec::new();
+        for i in 0..12 { data.push(((i % 3) as f64, log_d, 0u16)); }                  // bg b0, mean ~1
+        for i in 0..8  { data.push((18.0 + i as f64, log_d, 0u16)); }                 // sig b0, mean ~21
+        for i in 0..12 { data.push(((i % 3) as f64 + 1.0, log_d, 1u16)); }            // bg b1, mean ~2
+        for i in 0..8  { data.push((36.0 + i as f64, log_d, 1u16)); }                 // sig b1, mean ~39
+        let guide_data = GuideData { triples: data.clone(), n_zeros: 0 };
+
+        let mut resp = vec![0.0f64; data.len()];
+        let init = model.init(&guide_data, 2, 0.1);
+        let (fitted, _) = run_em(
+            init,
+            |p| model.em_cycle(p, &guide_data, 2, &mut resp),
+            300,
+            1e-9,
+        );
+
+        assert_eq!(fitted.gamma.len(), 2);
+        assert_eq!(fitted.gamma[0], 0.0, "γ_0 anchored at 0 for identifiability");
+        assert!(
+            fitted.gamma[1] > 0.3,
+            "γ_1 should be positive when batch 1 has elevated rates; got {}",
+            fitted.gamma[1]
+        );
+    }
+
+    #[test]
     fn score_and_decide_matches_assign() {
         let input = make_input_with_totals(
             6, 1,
