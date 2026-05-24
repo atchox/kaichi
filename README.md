@@ -14,7 +14,11 @@ confidence scores and multi-infection flags.
 | Interface | Install | README |
 |---|---|---|
 | Python (`pip install kaichi`) | PyPI | [kaichi-py/README.md](kaichi-py/README.md) |
-| CLI (`kaichi assign ...`) | `cargo install kaichi-cli` | [kaichi-cli/README.md](kaichi-cli/README.md) |
+| CLI (`kaichi assign`, `kaichi score`, `kaichi decide`) | `cargo install kaichi-cli` | [kaichi-cli/README.md](kaichi-cli/README.md) |
+
+Both interfaces support a **one-shot mode** (`assign`) and a **split mode**
+(`score` → `decide`) that fits the model once and lets you re-threshold
+without re-running EM.
 
 ## Workspace layout
 

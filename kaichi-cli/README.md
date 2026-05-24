@@ -19,37 +19,66 @@ cargo build --release -p kaichi-cli
 
 ## Quick start
 
-```bash
-kaichi assign \
-  --counts gRNA_counts.h5ad \
-  --output assignments.h5ad
-```
-
-The default model is `poisson_gauss`. To use a different one:
+One-shot (fit + threshold + write):
 
 ```bash
-kaichi assign \
-  --counts gRNA_counts.h5ad \
-  --output assignments.h5ad \
-  --model neg_binomial
+kaichi assign --counts gRNA_counts.h5ad --output assignments.h5ad
 ```
 
-Cap the number of worker threads (useful on shared HPC nodes):
+Split flow — fit once, threshold many times without re-running EM:
 
 ```bash
-kaichi assign \
-  --counts gRNA_counts.h5ad \
-  --output assignments.h5ad \
-  --threads 4
+# Fit and cache the score matrix to disk.
+kaichi score --counts gRNA_counts.h5ad --model poisson_gauss --output scored.h5ad
+
+# Threshold the cache — runs in milliseconds.
+kaichi decide --scores scored.h5ad --min-confidence 0.9 --output strict.h5ad
+kaichi decide --scores scored.h5ad --min-confidence 0.7 --output lenient.h5ad
 ```
 
-## Options
+The cache (`scored.h5ad`) is a regular AnnData file: `X` holds the preserved
+UMI counts, `layers/scores` holds the float32 posteriors, and `uns/kaichi`
+records the model name and fitted parameters. The `decide` step pulls the
+model identity from `uns/kaichi` automatically — you don't repeat `--model`.
+
+To cap worker threads on shared HPC nodes, add `--threads N` to any subcommand.
+
+## Subcommands
+
+### `kaichi assign`
+
+Fit a model and write the final assignment in one step.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--counts <PATH>` | — | Input `.h5ad` guide-count file (required) |
-| `--output <PATH>` | — | Output path: `.h5ad` or `.csv` (required) |
+| `--output <PATH>` | — | Output path: `.h5ad` or `.csv` |
 | `--model <NAME>` | `poisson_gauss` | Assignment model (see table below) |
+| `--threads <N>` | half of logical cores | Rayon worker thread cap |
+
+### `kaichi score`
+
+Fit a two-stage model and cache the score matrix. Single-stage models
+(`umi`, `ratio`, `max`) are rejected — use `assign` for those.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--counts <PATH>` | — | Input `.h5ad` guide-count file (required) |
+| `--model <NAME>` | `poisson_gauss` | One of `poisson_gauss`, `poisson`, `neg_binomial`, `binomial` |
+| `--output <PATH>` | — | Scored `.h5ad` output (required) |
+| `--threads <N>` | half of logical cores | Rayon worker thread cap |
+
+### `kaichi decide`
+
+Threshold a cached score H5AD into final assignments. The output extends the
+input with a `layers/assigned` group plus assignment obs columns.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--scores <PATH>` | — | Scored `.h5ad` from `kaichi score` (required) |
+| `--min-confidence <F>` | — | Posterior threshold in [0, 1] (required) |
+| `--output <PATH>` | — | Output `.h5ad` (mutually exclusive with `--in-place`) |
+| `--in-place` | off | Overwrite the input scored H5AD with the decided result |
 | `--threads <N>` | half of logical cores | Rayon worker thread cap |
 
 ## Models
@@ -83,7 +112,7 @@ This is the `crispr_gene_expression` feature-barcode matrix produced by Cell Ran
 
 ## Output
 
-Each row is one cell. Key fields:
+`assign` and `decide` produce the same shape, one row per cell:
 
 | Field | Type | Notes |
 |---|---|---|
@@ -99,3 +128,8 @@ Each row is one cell. Key fields:
 
 `.h5ad` output writes the full assignment table into `obs`. `.csv` output writes
 `cell_barcode`, `guide_id`, and `umi_count` only.
+
+`score` writes a partial H5AD with `X` = preserved UMI counts,
+`layers/scores` = float32 posteriors, and `uns/kaichi` carrying the model
+name and fitted parameters. `decide` reads this back and adds
+`layers/assigned`, the obs columns above, and `uns/kaichi/min_confidence`.

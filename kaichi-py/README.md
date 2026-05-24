@@ -1,10 +1,21 @@
-# kaichi — Python
+# kaichi
 
 [![PyPI](https://img.shields.io/pypi/v/kaichi)](https://pypi.org/project/kaichi/)
 [![Python](https://img.shields.io/pypi/pyversions/kaichi)](https://pypi.org/project/kaichi/)
 [![License](https://img.shields.io/github/license/atchox/kaichi)](https://github.com/atchox/kaichi/blob/main/LICENSE)
 
-CRISPR guide assignment for Perturb-seq, as a Python library.
+CRISPR guide assignment for Perturb-seq.
+
+A Perturb-seq experiment delivers a sparse `cells × guides` UMI count matrix
+from Cell Ranger. Before any downstream analysis, you have to decide which
+guide each cell actually received — separating real perturbations from
+ambient/background guide reads. kaichi runs that decision step.
+
+The Rust core ships ten assignment models (the count- and proportion-mixture
+methods used by [crispat](https://github.com/velten-group/crispat), plus
+simple UMI/ratio thresholds), fits guide-level EM in parallel, and returns
+zero-copy Arrow output. The same engine backs the [CLI](https://github.com/atchox/kaichi/tree/main/kaichi-cli)
+if you'd rather drive it from a shell pipeline.
 
 ## Install
 
@@ -26,6 +37,23 @@ adata = kaichi.assign("gRNA_counts.h5ad", model="poisson_gauss")
 scores = kaichi.score("gRNA_counts.h5ad", model="poisson_gauss")
 strict = kaichi.decide(scores, min_confidence=0.9)   # pyarrow.RecordBatch
 lenient = kaichi.decide(scores, min_confidence=0.7)  # reuses cached scores
+```
+
+`adata` is a standard `anndata.AnnData` you can drop into a scanpy workflow:
+
+```python
+>>> adata
+AnnData object with n_obs × n_vars = 21977 × 86
+    obs: 'guide_identity', 'assignment_confidence', 'n_guides_detected', 'is_unassigned', 'is_multi_infected'
+    uns: 'kaichi'
+    layers: 'assigned'
+
+>>> adata.obs.head(3)
+              guide_identity  assignment_confidence  is_unassigned  is_multi_infected
+cell_barcode
+AAACCCAAGAAA...           gRNA_42                  0.987          False              False
+AAACCCAAGAAC...                                     NaN           True              False
+AAACCCAAGAAG...           gRNA_07                  0.913          False              False
 ```
 
 ## API
@@ -74,6 +102,12 @@ thresholds without re-fitting.
 
 ## Models
 
+If you're not sure which to use, `poisson_gauss` (the default) is a sensible
+starting point for any UMI-based guide library. Switch to `neg_binomial` if
+the library is noticeably overdispersed (high variance for cells at similar
+sequencing depth), and to `binomial` if the experiment is dominated by total
+guide UMIs rather than per-guide counts.
+
 | Model | Type | When to use |
 |---|---|---|
 | `umi` | Threshold | Fast baseline; assign any guide ≥ N UMIs |
@@ -100,10 +134,3 @@ An `.h5ad` file with:
 - `X` — sparse count matrix (cells × guides)
 
 This is the `crispr_gene_expression` feature-barcode matrix produced by Cell Ranger.
-
-## Version
-
-```python
-import kaichi
-print(kaichi.__version__)
-```
