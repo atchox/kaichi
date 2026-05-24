@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-24
+
 ### Added
 
 - **Two-stage `score` / `decide` API.** `kaichi.score()` runs the EM fitting
@@ -79,5 +81,6 @@ Initial public release.
 - Design documents covering architecture, the model catalog with algorithm
   details, I/O spec, and binding interop contracts (`docs/design/`).
 
-[Unreleased]: https://github.com/atchox/kaichi/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/atchox/kaichi/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/atchox/kaichi/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/atchox/kaichi/releases/tag/v0.1.0
